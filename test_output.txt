@@ -1,0 +1,317 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.4, pytest-9.0.2, pluggy-1.6.0
+rootdir: C:\Users\86159\Desktop\Video-Transformer
+configfile: pytest.ini
+plugins: anyio-4.9.0, asyncio-1.3.0, cov-7.0.0, mock-3.15.1, respx-0.22.0, typeguard-4.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 17 items
+
+tests\test_analyzer.py ..FFFF.FF.FFF...F                                 [100%]
+
+================================== FAILURES ===================================
+___________ TestKnowledgeDocument.test_knowledge_document_creation ____________
+
+self = <test_analyzer.TestKnowledgeDocument object at 0x00000156FE40D160>
+
+    def test_knowledge_document_creation(self):
+>       doc = KnowledgeDocument(
+            title="测试标题",
+            one_sentence_summary="一句话核心",
+            key_takeaways=["结论1", "结论2"],
+            deep_dive=[{"topic": "主题1", "explanation": "解释1", "example": "例子1"}],
+            glossary={"术语1": "定义1"},
+            mind_map_structure=["root: 主题", "  - 分支1"],
+        )
+E       TypeError: KnowledgeDocument.__init__() got an unexpected keyword argument 'mind_map_structure'
+
+tests\test_analyzer.py:39: TypeError
+___________________ TestKnowledgeDocument.test_to_markdown ____________________
+
+self = <test_analyzer.TestKnowledgeDocument object at 0x00000156FE40D400>
+
+    def test_to_markdown(self):
+>       doc = KnowledgeDocument(
+            title="测试标题",
+            one_sentence_summary="一句话核心",
+            key_takeaways=["结论1", "结论2"],
+            deep_dive=[{"topic": "主题1", "explanation": "解释1", "example": "例子1"}],
+            glossary={"术语1": "定义1"},
+            mind_map_structure=["root: 主题", "  - 分支1"],
+        )
+E       TypeError: KnowledgeDocument.__init__() got an unexpected keyword argument 'mind_map_structure'
+
+tests\test_analyzer.py:55: TypeError
+______________ TestAnalysisResult.test_analysis_result_creation _______________
+
+self = <test_analyzer.TestAnalysisResult object at 0x00000156FE40D6A0>
+
+    def test_analysis_result_creation(self):
+>       doc = KnowledgeDocument(
+            title="测试标题",
+            one_sentence_summary="一句话核心",
+            key_takeaways=["结论1"],
+            deep_dive=[],
+            glossary={"术语1": "定义1"},
+            mind_map_structure=["root: 主题"],
+        )
+E       TypeError: KnowledgeDocument.__init__() got an unexpected keyword argument 'mind_map_structure'
+
+tests\test_analyzer.py:85: TypeError
+__________________ TestAnalysisResult.test_from_api_response __________________
+
+self = <test_analyzer.TestAnalysisResult object at 0x00000156FE40D940>
+
+    def test_from_api_response(self):
+        response_data = {
+            "title": "API 测试标题",
+            "one_sentence_summary": "API 测试核心",
+            "key_takeaways": ["结论A", "结论B"],
+            "deep_dive": [{"topic": "A", "explanation": "Exp A"}],
+            "glossary": {"术语A": "定义A"},
+            "mind_map_structure": ["root: API", "  - Node A"],
+        }
+    
+        result = AnalysisResult.from_api_response(
+            video_path="api_test.mp4",
+            response_data=response_data,
+        )
+    
+        assert result.title == "API 测试标题"
+        assert len(result.knowledge_doc.key_takeaways) == 2
+>       assert len(result.knowledge_doc.mind_map_structure) == 2
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'KnowledgeDocument' object has no attribute 'mind_map_structure'
+
+tests\test_analyzer.py:121: AttributeError
+______________ TestAnalysisResult.test_to_markdown_with_mind_map ______________
+
+self = <test_analyzer.TestAnalysisResult object at 0x00000156FE40D850>
+
+    def test_to_markdown_with_mind_map(self):
+>       doc = KnowledgeDocument(
+            title="完整测试",
+            one_sentence_summary="完整核心",
+            key_takeaways=["结论1"],
+            deep_dive=[],
+            glossary={"术语1": "定义1"},
+            mind_map_structure=["root: 主题"],
+        )
+E       TypeError: KnowledgeDocument.__init__() got an unexpected keyword argument 'mind_map_structure'
+
+tests\test_analyzer.py:136: TypeError
+______________ TestContentAnalyzer.test_init_with_fixed_api_key _______________
+
+self = <MagicMock name='Client' id='1473144472496'>, args = ()
+kwargs = {'api_key': 'test_api_key'}, expected = call(api_key='test_api_key')
+actual = call(api_key='test_api_key', http_options={'timeout': 600000})
+_error_message = <function NonCallableMock.assert_called_with.<locals>._error_message at 0x00000156FE416A20>
+cause = None
+
+    def assert_called_with(self, /, *args, **kwargs):
+        """assert that the last call was made with the specified arguments.
+    
+        Raises an AssertionError if the args and keyword args passed in are
+        different to the last call to the mock."""
+        if self.call_args is None:
+            expected = self._format_mock_call_signature(args, kwargs)
+            actual = 'not called.'
+            error_message = ('expected call not found.\nExpected: %s\n  Actual: %s'
+                    % (expected, actual))
+            raise AssertionError(error_message)
+    
+        def _error_message():
+            msg = self._format_mock_failure_message(args, kwargs)
+            return msg
+        expected = self._call_matcher(_Call((args, kwargs), two=True))
+        actual = self._call_matcher(self.call_args)
+        if actual != expected:
+            cause = expected if isinstance(expected, Exception) else None
+>           raise AssertionError(_error_message()) from cause
+E           AssertionError: expected call not found.
+E           Expected: Client(api_key='test_api_key')
+E             Actual: Client(api_key='test_api_key', http_options={'timeout': 600000})
+
+D:\anaconda\Lib\unittest\mock.py:944: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+self = <MagicMock name='Client' id='1473144472496'>, args = ()
+kwargs = {'api_key': 'test_api_key'}
+
+    def assert_called_once_with(self, /, *args, **kwargs):
+        """assert that the mock was called exactly once and that that call was
+        with the specified arguments."""
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to be called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+            raise AssertionError(msg)
+>       return self.assert_called_with(*args, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: expected call not found.
+E       Expected: Client(api_key='test_api_key')
+E         Actual: Client(api_key='test_api_key', http_options={'timeout': 600000})
+E       
+E       pytest introspection follows:
+E       
+E       Kwargs:
+E       assert {'api_key': '...out': 600000}} == {'api_key': 'test_api_key'}
+E         
+E         Omitting 1 identical items, use -vv to show
+E         Left contains 1 more item:
+E         {'http_options': {'timeout': 600000}}
+E         Use -v to get more diff
+
+D:\anaconda\Lib\unittest\mock.py:956: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+self = <test_analyzer.TestContentAnalyzer object at 0x00000156FE40D340>
+mock_config = {'analyzer': {'max_output_tokens': 8192, 'model': 'gemini-2.5-flash', 'retry_times': 3, 'temperature': 0.7, ...}, 'proxy': {'base_url': 'http://localhost:8000', 'timeout': 60}}
+mock_api_counter = APICounter(max_calls=10, current_count=0)
+mock_logger = <MagicMock id='1473144981600'>
+
+    def test_init_with_fixed_api_key(self, mock_config, mock_api_counter, mock_logger):
+        with patch("analyzer.content_analyzer.genai.Client") as mock_client_class:
+            analyzer = ContentAnalyzer(
+                config=mock_config,
+                api_counter=mock_api_counter,
+                logger=mock_logger,
+                api_key="test_api_key",
+            )
+    
+>           mock_client_class.assert_called_once_with(api_key="test_api_key")
+E           AssertionError: expected call not found.
+E           Expected: Client(api_key='test_api_key')
+E             Actual: Client(api_key='test_api_key', http_options={'timeout': 600000})
+E           
+E           pytest introspection follows:
+E           
+E           Kwargs:
+E           assert {'api_key': '...out': 600000}} == {'api_key': 'test_api_key'}
+E             
+E             Omitting 1 identical items, use -vv to show
+E             Left contains 1 more item:
+E             {'http_options': {'timeout': 600000}}
+E             Use -v to get more diff
+
+tests\test_analyzer.py:192: AssertionError
+___________ TestContentAnalyzer.test_allocate_key_from_pool_success ___________
+
+self = <test_analyzer.TestContentAnalyzer object at 0x00000156FE40DCA0>
+mock_config = {'analyzer': {'max_output_tokens': 8192, 'model': 'gemini-2.5-flash', 'retry_times': 3, 'temperature': 0.7, ...}, 'proxy': {'base_url': 'http://localhost:8000', 'timeout': 60}}
+mock_api_counter = APICounter(max_calls=10, current_count=0)
+mock_logger = <MagicMock id='1473144898144'>
+
+    def test_allocate_key_from_pool_success(
+        self, mock_config, mock_api_counter, mock_logger
+    ):
+        analyzer = ContentAnalyzer(
+            config=mock_config,
+            api_counter=mock_api_counter,
+            logger=mock_logger,
+        )
+    
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"key_id": "key_1", "api_key": "AIzaSy_real_key"}
+    
+        with patch("analyzer.content_analyzer.requests.post", return_value=mock_resp):
+            with patch("analyzer.content_analyzer.genai.Client") as mock_client_class:
+>               analyzer._allocate_key_from_pool()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E               AttributeError: 'ContentAnalyzer' object has no attribute '_allocate_key_from_pool'
+
+tests\test_analyzer.py:231: AttributeError
+__________ TestContentAnalyzer.test_allocate_key_from_pool_exhausted __________
+
+self = <test_analyzer.TestContentAnalyzer object at 0x00000156FE40DFA0>
+mock_config = {'analyzer': {'max_output_tokens': 8192, 'model': 'gemini-2.5-flash', 'retry_times': 3, 'temperature': 0.7, ...}, 'proxy': {'base_url': 'http://localhost:8000', 'timeout': 60}}
+mock_api_counter = APICounter(max_calls=10, current_count=0)
+mock_logger = <MagicMock id='1473145278528'>
+
+    def test_allocate_key_from_pool_exhausted(
+        self, mock_config, mock_api_counter, mock_logger
+    ):
+        analyzer = ContentAnalyzer(
+            config=mock_config,
+            api_counter=mock_api_counter,
+            logger=mock_logger,
+        )
+    
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+    
+        with patch("analyzer.content_analyzer.requests.post", return_value=mock_resp):
+            with pytest.raises(RuntimeError, match="已耗尽"):
+>               analyzer._allocate_key_from_pool()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E               AttributeError: 'ContentAnalyzer' object has no attribute '_allocate_key_from_pool'
+
+tests\test_analyzer.py:251: AttributeError
+______ TestContentAnalyzer.test_allocate_key_from_pool_connection_error _______
+
+self = <test_analyzer.TestContentAnalyzer object at 0x00000156FE40E2D0>
+mock_config = {'analyzer': {'max_output_tokens': 8192, 'model': 'gemini-2.5-flash', 'retry_times': 3, 'temperature': 0.7, ...}, 'proxy': {'base_url': 'http://localhost:8000', 'timeout': 60}}
+mock_api_counter = APICounter(max_calls=10, current_count=0)
+mock_logger = <MagicMock id='1473145311344'>
+
+    def test_allocate_key_from_pool_connection_error(
+        self, mock_config, mock_api_counter, mock_logger
+    ):
+        analyzer = ContentAnalyzer(
+            config=mock_config,
+            api_counter=mock_api_counter,
+            logger=mock_logger,
+        )
+    
+        import requests as req
+    
+        with patch(
+            "analyzer.content_analyzer.requests.post",
+            side_effect=req.ConnectionError("refused"),
+        ):
+            with pytest.raises(RuntimeError, match="无法连接"):
+>               analyzer._allocate_key_from_pool()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E               AttributeError: 'ContentAnalyzer' object has no attribute '_allocate_key_from_pool'
+
+tests\test_analyzer.py:269: AttributeError
+__________________ TestContentAnalyzer.test_generate_report ___________________
+
+self = <test_analyzer.TestContentAnalyzer object at 0x00000156FE40F050>
+mock_config = {'analyzer': {'max_output_tokens': 8192, 'model': 'gemini-2.5-flash', 'retry_times': 3, 'temperature': 0.7, ...}, 'proxy': {'base_url': 'http://localhost:8000', 'timeout': 60}}
+mock_api_counter = APICounter(max_calls=10, current_count=0)
+mock_logger = <MagicMock id='1473145972704'>
+
+    def test_generate_report(self, mock_config, mock_api_counter, mock_logger):
+        analyzer = ContentAnalyzer(
+            config=mock_config,
+            api_counter=mock_api_counter,
+            logger=mock_logger,
+        )
+    
+>       doc = KnowledgeDocument(
+            title="测试文档",
+            one_sentence_summary="测试核心",
+            key_takeaways=["结论1"],
+            deep_dive=[],
+            glossary={"术语1": "定义1"},
+            mind_map_structure=["root: 主题"],
+        )
+E       TypeError: KnowledgeDocument.__init__() got an unexpected keyword argument 'mind_map_structure'
+
+tests\test_analyzer.py:319: TypeError
+=========================== short test summary info ===========================
+FAILED tests/test_analyzer.py::TestKnowledgeDocument::test_knowledge_document_creation
+FAILED tests/test_analyzer.py::TestKnowledgeDocument::test_to_markdown - Type...
+FAILED tests/test_analyzer.py::TestAnalysisResult::test_analysis_result_creation
+FAILED tests/test_analyzer.py::TestAnalysisResult::test_from_api_response - A...
+FAILED tests/test_analyzer.py::TestAnalysisResult::test_to_markdown_with_mind_map
+FAILED tests/test_analyzer.py::TestContentAnalyzer::test_init_with_fixed_api_key
+FAILED tests/test_analyzer.py::TestContentAnalyzer::test_allocate_key_from_pool_success
+FAILED tests/test_analyzer.py::TestContentAnalyzer::test_allocate_key_from_pool_exhausted
+FAILED tests/test_analyzer.py::TestContentAnalyzer::test_allocate_key_from_pool_connection_error
+FAILED tests/test_analyzer.py::TestContentAnalyzer::test_generate_report - Ty...
+======================== 10 failed, 7 passed in 1.66s =========================
