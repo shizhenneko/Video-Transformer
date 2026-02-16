@@ -14,15 +14,32 @@ from typing import Any
 
 import requests
 
-from analyzer.content_analyzer import ContentAnalyzer
-from auditor.quality_auditor import QualityAuditor
-from downloader.video_downloader import VideoDownloader
-from models import BatchResult, ProcessResult
-from utils.counter import APICounter, APILimitExceeded
-from utils.gemini_throttle import GeminiThrottle
-from utils.progress_tracker import ProgressTracker
-from validator.consistency_validator import ConsistencyValidator
-from visualizer.image_generator import ImageGenerator
+from analyzer.content_analyzer import (  # type: ignore[reportImplicitRelativeImport]
+    ContentAnalyzer,
+)
+from auditor.quality_auditor import (  # type: ignore[reportImplicitRelativeImport]
+    QualityAuditor,
+)
+from downloader.video_downloader import (  # type: ignore[reportImplicitRelativeImport]
+    VideoDownloader,
+)
+from models import BatchResult, ProcessResult  # type: ignore[reportImplicitRelativeImport]
+from utils.counter import (  # type: ignore[reportImplicitRelativeImport]
+    APICounter,
+    APILimitExceeded,
+)
+from utils.gemini_throttle import (  # type: ignore[reportImplicitRelativeImport]
+    GeminiThrottle,
+)
+from utils.progress_tracker import (  # type: ignore[reportImplicitRelativeImport]
+    ProgressTracker,
+)
+from validator.consistency_validator import (  # type: ignore[reportImplicitRelativeImport]
+    ConsistencyValidator,
+)
+from visualizer.image_generator import (  # type: ignore[reportImplicitRelativeImport]
+    ImageGenerator,
+)
 
 
 class VideoPipeline:
@@ -65,19 +82,6 @@ class VideoPipeline:
             logger=logger,
         )
 
-        self.validator = ConsistencyValidator(
-            config=config,
-            api_counter=api_counter,
-            logger=logger,
-        )
-
-        self.generator = ImageGenerator(
-            config=config,
-            logger=logger,
-        )
-
-
-
         # 输出目录
         self.output_dir = Path(config["system"]["output_dir"])
         self.doc_dir = self.output_dir / "documents"
@@ -86,6 +90,8 @@ class VideoPipeline:
         # 创建输出目录
         self.doc_dir.mkdir(parents=True, exist_ok=True)
         self.blueprint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.self_check_mode = self._resolve_self_check_mode(config)
 
         # 校验配置
         validator_config = config.get("validator", {})
@@ -107,10 +113,11 @@ class VideoPipeline:
         start_time = time.time()
         video_id = self._extract_video_id(url)
 
-        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"event=video_start video_id={video_id}")
+        self.logger.info(f"\n{'=' * 60}")
         self.logger.info(f"开始处理视频: {video_id}")
         self.logger.info(f"URL: {url}")
-        self.logger.info(f"{'='*60}")
+        self.logger.info(f"{'=' * 60}")
 
         # 检查是否已处理
         if self.progress_tracker and self.progress_tracker.is_processed(video_id):
@@ -127,7 +134,7 @@ class VideoPipeline:
 
         # 1. 分配当前视频专用 Key
         current_api_key = self._allocate_gemini_key()
-        
+
         # 2. 创建共享限流器 (同一个视频任务内所有 Gemini 调用共享限速)
         analyzer_config = self.config.get("analyzer", {})
         throttle = GeminiThrottle(
@@ -136,7 +143,7 @@ class VideoPipeline:
             max_total_wait=analyzer_config.get("max_retry_wait", 600.0),
             logger=self.logger,
         )
-        
+
         # 3. 实例化组件 (使用当前分配的 Key + 共享限流器)
         analyzer = ContentAnalyzer(
             config=self.config,
@@ -170,14 +177,24 @@ class VideoPipeline:
 
             # 步骤 3: 校验与改写循环
             self.logger.info("\n[3/5] 校验知识蓝图 Visual Schema...")
+            first_schema = (
+                analysis_result.knowledge_doc.visual_schemas[0].schema
+                if analysis_result.knowledge_doc.visual_schemas
+                else ""
+            )
             final_structure = self._validation_loop(
-                analysis_result.knowledge_doc.visual_schema, analysis_result.knowledge_doc.to_markdown()
+                first_schema,
+                analysis_result.knowledge_doc.to_markdown(
+                    self_check_mode=self.self_check_mode
+                ),
+                analyzer,
             )
 
             # 步骤 4: 生成图片
             image_data = None
             audit_result = None
-            
+            image_timeout = False
+
             if final_structure:
                 self.logger.info("\n[4/5] 生成知识蓝图图片...")
                 try:
@@ -187,19 +204,25 @@ class VideoPipeline:
 
                         # 步骤 5: 审核图片
                         self.logger.info("\n[5/5] 审核图片质量...")
-                        blueprint_path_temp = self.output_dir / "temp" / f"{video_id}_temp.png"
+                        blueprint_path_temp = (
+                            self.output_dir / "temp" / f"{video_id}_temp.png"
+                        )
                         blueprint_path_temp.parent.mkdir(parents=True, exist_ok=True)
-                        
+
                         try:
                             self.generator.save_image(image_data, blueprint_path_temp)
 
                             audit_result = auditor.audit_image(
                                 image_path=blueprint_path_temp,
-                                knowledge_doc_content=analysis_result.knowledge_doc.to_markdown(),
+                                knowledge_doc_content=analysis_result.knowledge_doc.to_markdown(
+                                    self_check_mode=self.self_check_mode
+                                ),
                             )
-                            
+
                             if audit_result.passed:
-                                self.logger.info(f"✅ 审核通过 (分数: {audit_result.score:.1f})")
+                                self.logger.info(
+                                    f"✅ 审核通过 (分数: {audit_result.score:.1f})"
+                                )
                             else:
                                 self.logger.warning(
                                     f"❌ 审核未通过 (分数: {audit_result.score:.1f} < {auditor.threshold})\n"
@@ -207,36 +230,61 @@ class VideoPipeline:
                                 )
                                 self.logger.info("丢弃质量不佳的图片")
                                 image_data = None
-                                audit_result = None # Clear result so it doesn't show up as success in stats? or keep it?
+                                audit_result = None  # Clear result so it doesn't show up as success in stats? or keep it?
                                 # Keep explicit audit result for logging/stats if needed, but here we just need to ensure image is not saved.
-                                
+
                         except Exception as e:
-                            self.logger.warning(f"⚠️ 图片审核过程出错 (已保留原图)，跳过审核: {e}") 
+                            self.logger.warning(
+                                f"⚠️ 图片审核过程出错 (已保留原图)，跳过审核: {e}"
+                            )
                             # If audit fails due to error (not quality), we currently keep the image.
                             # Is this desired? "Kimi 看到质量不佳的图应该直接拒绝".
                             # If audit crashes, we might want to keep it or discard it. The prompt implies "quality poor".
-                            # So exception means we don't know the quality. Defaulting to keep is safer for "errors", 
+                            # So exception means we don't know the quality. Defaulting to keep is safer for "errors",
                             # but for "quality failure" we discard.
-                        
+
                         # 清理临时文件
                         if blueprint_path_temp.exists():
-                           blueprint_path_temp.unlink()
+                            blueprint_path_temp.unlink()
 
                     else:
                         self.logger.warning("❌ 图片生成返回空数据")
-                
+
+                except RuntimeError as e:
+                    reason = "timeout" if "timeout" in str(e) else "error"
+                    self.logger.warning(
+                        "event=image_generation_failed "
+                        f"reason={reason} video_id={video_id} error={e}"
+                    )
+                    image_data = None
+                    if reason == "timeout":
+                        image_timeout = True
+
                 except Exception as e:
-                     self.logger.error(f"❌ 图片生成失败: {e}", exc_info=True)
-                     image_data = None
+                    self.logger.error(f"❌ 图片生成失败: {e}", exc_info=True)
+                    image_data = None
             else:
                 self.logger.warning("⚠️ Visual Schema 为空，跳过图片生成与审核")
 
             # 保存最终输出
-            image_relative_path = f"../blueprints/{video_id}_mind_map.png" if image_data else None
-            
+            image_relative_path = (
+                f"../blueprints/{video_id}_mind_map.png" if image_data else None
+            )
+
+            document_content = analyzer.generate_report(
+                analysis_result,
+                image_relative_path,
+                self_check_mode=self.self_check_mode,
+            )
+            if image_timeout:
+                document_content = (
+                    "⚠️ Image generation timed out, Markdown-only output\n\n"
+                    f"{document_content}"
+                )
+
             doc_path, blueprint_path = self._save_outputs(
                 video_id=video_id,
-                document_content=analyzer.generate_report(analysis_result, image_relative_path),
+                document_content=document_content,
                 image_data=image_data,
             )
 
@@ -259,19 +307,25 @@ class VideoPipeline:
                 audit_score=audit_result.score if audit_result else 0.0,
             )
 
-            self.logger.info(f"\n{'='*60}")
+            self.logger.info(
+                f"event=video_complete video_id={video_id} elapsed_s={processing_time:.1f}"
+            )
+            self.logger.info(f"\n{'=' * 60}")
             self.logger.info(f"✅ 处理成功: {video_id}")
             if not blueprint_path:
                 self.logger.info("⚠️ 注意: 未生成知识蓝图图片")
             self.logger.info(f"API 调用: {api_calls_used}")
             self.logger.info(f"耗时: {processing_time:.1f}s")
-            self.logger.info(f"{'='*60}\n")
+            self.logger.info(f"{'=' * 60}\n")
 
             return result
 
         except APILimitExceeded as e:
-            self.logger.error(f"❌ API 调用次数超限: {e}")
             processing_time = time.time() - start_time
+            self.logger.error(
+                f"event=video_failed video_id={video_id} elapsed_s={processing_time:.1f} error=API_LIMIT_EXCEEDED"
+            )
+            self.logger.error(f"❌ API 调用次数超限: {e}")
             return ProcessResult(
                 video_id=video_id,
                 url=url,
@@ -281,8 +335,11 @@ class VideoPipeline:
             )
 
         except Exception as e:
-            self.logger.error(f"❌ 处理失败: {e}", exc_info=True)
             processing_time = time.time() - start_time
+            self.logger.error(
+                f"event=video_failed video_id={video_id} elapsed_s={processing_time:.1f} error={str(e)}"
+            )
+            self.logger.error(f"❌ 处理失败: {e}", exc_info=True)
 
             # 标记为失败
             if self.progress_tracker:
@@ -317,7 +374,7 @@ class VideoPipeline:
             # 检查 API 调用次数
             if not self.api_counter.can_call():
                 self.logger.warning(
-                    f"API 调用次数已达上限,终止批量处理 (已处理 {idx-1}/{total})"
+                    f"API 调用次数已达上限,终止批量处理 (已处理 {idx - 1}/{total})"
                 )
                 break
 
@@ -334,7 +391,7 @@ class VideoPipeline:
         return result
 
     def _validation_loop(
-        self, initial_structure: str, knowledge_content: str
+        self, initial_structure: str, knowledge_content: str, analyzer: ContentAnalyzer
     ) -> str:
         """
         校验-改写循环
@@ -342,14 +399,15 @@ class VideoPipeline:
         Args:
             initial_structure: 初始 Visual Schema
             knowledge_content: 知识笔记内容
+            analyzer: ContentAnalyzer 实例，用于改写 Visual Schema
 
         Returns:
             最终的 Visual Schema
         """
         current_structure = initial_structure
         if not current_structure:
-             self.logger.warning("Visual Schema 为空，跳过校验")
-             return ""
+            self.logger.warning("Visual Schema 为空，跳过校验")
+            return ""
 
         for round_num in range(1, self.max_validation_rounds + 1):
             self.logger.info(f"  第 {round_num} 轮校验...")
@@ -360,9 +418,7 @@ class VideoPipeline:
                     knowledge_doc_content=knowledge_content,
                 )
 
-                self.logger.info(
-                    f"  校验得分: {validation_result.total_score:.1f}/100"
-                )
+                self.logger.info(f"  校验得分: {validation_result.total_score:.1f}/100")
 
                 if validation_result.passed:
                     self.logger.info(f"  ✅ 校验通过!")
@@ -421,6 +477,14 @@ class VideoPipeline:
 
         return doc_path, blueprint_path
 
+    @staticmethod
+    def _resolve_self_check_mode(config: dict[str, Any]) -> str:
+        mode = str(config.get("system", {}).get("self_check_mode", "static"))
+        normalized = mode.strip().lower()
+        if normalized in {"static", "interactive", "questions_only"}:
+            return normalized
+        return "static"
+
     def _extract_video_id(self, url: str) -> str:
         """
         从 URL 提取视频 ID (支持分集)
@@ -432,12 +496,12 @@ class VideoPipeline:
             视频 ID (如果包含分集 p 参数,会附加 _p{N})
         """
         video_id = None
-        
+
         # Bilibili BV 号匹配
         bv_match = re.search(r"BV[a-zA-Z0-9]+", url)
         if bv_match:
             video_id = bv_match.group(0)
-            
+
             # 检查是否有分集参数 (p=X)
             p_match = re.search(r"[?&]p=(\d+)", url)
             if p_match:
@@ -453,8 +517,9 @@ class VideoPipeline:
         # 其他情况,使用 URL 的哈希值
         if not video_id:
             import hashlib
+
             video_id = hashlib.md5(url.encode()).hexdigest()[:12]
-            
+
         return video_id
 
     def _allocate_gemini_key(self) -> str | None:

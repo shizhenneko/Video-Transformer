@@ -18,7 +18,10 @@ import requests
 from PIL import Image
 
 
-from analyzer.prompt_loader import load_prompts, render_prompt
+from analyzer.prompt_loader import (  # type: ignore[reportImplicitRelativeImport]
+    load_prompts,
+    render_prompt,
+)
 
 
 @dataclass
@@ -69,7 +72,7 @@ class ImageGenerator:
 
         # 加载提示词模板
         self.prompts = load_prompts()
-        
+
         self.logger.info("ImageGenerator 初始化完成 (grsai 中转站)")
 
     def generate_blueprint(
@@ -90,7 +93,7 @@ class ImageGenerator:
         """
         if not visual_schema:
             raise ValueError("Visual Schema 为空，无法生成图片")
-            
+
         prompt = self._build_generation_prompt(visual_schema)
 
         try:
@@ -128,14 +131,14 @@ class ImageGenerator:
 
     def _build_generation_prompt(self, schema: str) -> str:
         """构建图像生成 Prompt"""
-        
+
         renderer_config = self.prompts.get("nano_banana_renderer", {})
         prompt_template = renderer_config.get("prompt", "")
-        
+
         if not prompt_template:
             self.logger.warning("未找到 nano_banana_renderer 提示词模板，使用默认模板")
             return f"Draw a diagram based on:\n{schema}"
-            
+
         return render_prompt(prompt_template, visual_schema=schema)
 
     def _call_grsai_draw_api(self, prompt: str) -> bytes:
@@ -179,7 +182,7 @@ class ImageGenerator:
             image_url = self._poll_draw_result(result_url, headers, task_id)
 
             self.logger.info(f"下载图片: {image_url}")
-            
+
             # 使用 Session 和 Retry 机制下载图片，增强稳定性
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
@@ -189,7 +192,7 @@ class ImageGenerator:
                 total=3,
                 backoff_factor=1,
                 status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["HEAD", "GET", "OPTIONS"]
+                allowed_methods=["HEAD", "GET", "OPTIONS"],
             )
             adapter = HTTPAdapter(max_retries=retry_strategy)
             session.mount("https://", adapter)
@@ -200,7 +203,9 @@ class ImageGenerator:
                 img_response.raise_for_status()
                 return img_response.content
             except requests.exceptions.SSLError as e:
-                self.logger.warning(f"下载图片 SSL 验证失败: {e}，尝试禁用 SSL 验证重试...")
+                self.logger.warning(
+                    f"下载图片 SSL 验证失败: {e}，尝试禁用 SSL 验证重试..."
+                )
                 # 最后的兜底：如果 SSL 失败，尝试禁用验证 (虽然不安全，但在这种场景下通常可以接受)
                 img_response = session.get(image_url, timeout=60, verify=False)
                 img_response.raise_for_status()
@@ -215,10 +220,9 @@ class ImageGenerator:
         self, result_url: str, headers: dict[str, str], task_id: str
     ) -> str:
         """轮询获取绘画结果，返回图片 URL"""
+        start_time = time.time()
 
-        deadline = time.time() + self.img_config.poll_timeout
-
-        while time.time() < deadline:
+        while True:
             time.sleep(self.img_config.poll_interval)
 
             try:
@@ -238,6 +242,17 @@ class ImageGenerator:
                 status = task_data.get("status", "")
                 progress = task_data.get("progress", 0)
 
+                elapsed = time.time() - start_time
+                self.logger.info(
+                    "event=grsai_poll "
+                    f"elapsed={elapsed:.1f}s status={status} "
+                    f"progress={progress}% task_id={task_id}"
+                )
+
+                if elapsed > self.img_config.poll_timeout:
+                    self.logger.warning(f"event=grsai_timeout task_id={task_id}")
+                    raise RuntimeError("grsai polling timeout")
+
                 if status == "succeeded":
                     results = task_data.get("results", [])
                     if not results or not results[0].get("url"):
@@ -249,12 +264,8 @@ class ImageGenerator:
                     error = task_data.get("error", "")
                     raise RuntimeError(f"绘画任务失败: reason={reason}, error={error}")
 
-                self.logger.info(f"绘画进度: {progress}%, status={status}")
-
             except requests.RequestException as e:
                 self.logger.warning(f"轮询请求失败: {e}")
-
-        raise RuntimeError(f"绘画任务超时 ({self.img_config.poll_timeout}s): {task_id}")
 
     def _validate_image(self, image_data: bytes) -> bool:
         """验证图片有效性"""

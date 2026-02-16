@@ -67,6 +67,18 @@ analyzer:
 
 Prompt 模板在 `config/prompts.yaml` 中定义，可自定义分析风格和输出格式。
 
+API 密钥请通过环境变量提供：
+
+- `VT_GEMINI_API_KEY`
+- `VT_KIMI_API_KEY`
+- `VT_NANO_BANANA_API_KEY`
+
+推荐做法：复制 `env.example` 为 `.env`，写入密钥后直接运行。
+
+```bash
+cp env.example .env
+```
+
 ## 使用方法
 
 ### 1. 启动号池代理
@@ -88,6 +100,7 @@ python demo_downloader.py
 
 ```python
 from pathlib import Path
+import os
 import sys
 
 sys.path.insert(0, "src")
@@ -104,8 +117,13 @@ counter = APICounter(max_calls=10)
 # 号池模式（自动从代理分配 Key）
 analyzer = ContentAnalyzer(config=config, api_counter=counter, logger=logger)
 
-# 或直接指定 Key
-# analyzer = ContentAnalyzer(config=config, api_counter=counter, logger=logger, api_key="AIzaSy...")
+# 或直接指定 Key (建议从环境变量读取)
+# analyzer = ContentAnalyzer(
+#     config=config,
+#     api_counter=counter,
+#     logger=logger,
+#     api_key=os.environ.get("VT_GEMINI_API_KEY"),
+# )
 
 result = analyzer.analyze_video("data/temp/videos/example.mp4")
 print(result.to_markdown())

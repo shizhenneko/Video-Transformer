@@ -1,0 +1,42 @@
+Integration Test Verification - Full Error Recovery Flow
+=========================================================
+
+Test File: tests/test_full_error_recovery.py
+Status: ✅ PASSED (15.97s)
+
+Test Coverage:
+--------------
+1. JSON Repair: Simulates stray tokens in Gemini response → LLM repair succeeds
+2. Validation Retry: First validation fails (score 35) → rewrite triggered → second validation passes (score 80)
+3. Image Timeout: generate_blueprint raises RuntimeError → graceful degradation to Markdown-only
+4. Success Criteria: ProcessResult.success=True, blueprint_path=None, document_path exists
+
+Key Assertions Verified:
+------------------------
+✓ result.success is True (graceful degradation works)
+✓ result.blueprint_path is None (image generation failed as expected)
+✓ result.document_path is not None (Markdown generated successfully)
+✓ Document file exists on disk
+✓ mock_stream called 2x (initial + retry)
+✓ mock_repair called 1x (JSON repair)
+✓ mock_rewrite called 1x (schema rewrite after validation failure)
+✓ FakeValidator called 2x (fail → pass)
+✓ FakeGenerator called 1x (timeout)
+✓ Log events present: video_start, video_complete
+
+Mock Strategy:
+--------------
+- FakeDownloader: Returns test video path
+- FakeValidator: Returns score 35 on first call, 80 on second
+- FakeGenerator: Raises RuntimeError("grsai polling timeout")
+- ContentAnalyzer._stream_response: Returns broken JSON, then valid JSON
+- ContentAnalyzer._call_gemini_text_api: Returns repaired JSON
+- ContentAnalyzer.rewrite_visual_schema: Returns "updated schema string"
+
+Conclusion:
+-----------
+The integration test successfully validates that all error recovery mechanisms work together:
+- JSON repair handles malformed responses
+- Validation loop triggers schema rewrite when score < threshold
+- Image generation timeout doesn't fail the entire pipeline
+- Markdown document is generated even when blueprint fails
