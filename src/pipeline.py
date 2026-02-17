@@ -479,7 +479,7 @@ class VideoPipeline:
     def _resolve_self_check_mode(config: dict[str, Any]) -> str:
         mode = str(config.get("system", {}).get("self_check_mode", "static"))
         normalized = mode.strip().lower()
-        if normalized in {"static", "interactive", "questions_only"}:
+        if normalized in {"static", "interactive", "questions_only", "default"}:
             return normalized
         return "static"
 

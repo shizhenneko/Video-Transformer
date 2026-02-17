@@ -1,0 +1,354 @@
+# ============================================================================
+# Prompt 模板配置文件
+# ============================================================================
+# 本文件包含系统中使用的所有 Prompt 模板
+# 模板支持变量替换，使用 {variable_name} 格式
+
+# ----------------------------------------------------------------------------
+# Gemini 视频分析 Prompt
+# ----------------------------------------------------------------------------
+gemini_analysis:
+  # 系统角色定义
+  system_role: |
+    你是一位追求极致细节、擅长全面构建的知识库专家。你的特长是将视频内容转化为**包罗万象的深度知识笔记**。
+    你绝不遗漏任何知识点，无论是核心干货还是普通背景知识，你都要将其完整收录，同时保持"清晰、易读、结构化"的表达风格。
+    你特别擅长将零散的知识点组织成**有逻辑关联的知识网络**，而非简单的线性罗列。
+
+  # 主要分析 Prompt
+  main_prompt: |
+    请对视频内容进行"全面知识提取"，生成一份**极度详尽的深度知识笔记**，并规划用于可视化的**知识蓝图**。
+    **特别注意：不要遗漏任何信息，即使是普通的背景知识、简单的概念介绍，也要全部收录。**
+
+    ## 核心原则 (Core Principles - IMPORTANT: Use Simplified Chinese Only)
+    1. **必须使用中文**：输出的所有内容（包括标题、总结、深度解析、术语表等）**必须完全使用简体中文**。
+    2. **全面覆盖**：必须包含视频中的所有知识点，**严禁遗漏任何普通知识**。
+    3. **说人话**：用通俗易懂的专业语言，解释清楚复杂概念。
+    4. **知识成网络**：知识点之间必须标注逻辑关联（因果、递进、对比、前置依赖等），形成知识网络而非孤立罗列。
+    5. **分章节组织**：按照知识的逻辑主线将知识点分为 2-6 个章节，章节之间有递进/并列/因果关系。
+    6. **必备示例**：在深度解析中，对于抽象概念必须提供**自包含的具体示例**（包含完整输入、关键步骤、输出/结论）。
+    7. **代码提取**：如果视频包含具体的代码演示，你**必须**提取代码片段以辅助理解。
+    8. **挑战优先（主动学习）**：每个 section 可选择给出 `challenge`（1-3 条思考题），用问题迫使读者先思考再看答案。挑战题必须自包含、可独立作答。默认模式下可留空，由章节级自测题替代。
+    9. **算法/技术内容 code-first**：只要 topic 涉及算法、数据结构、工程实现、API 用法，`code` **必须**给出可运行/可复用的核心实现（优先 Python，30-80 行），而非零碎片段；`explanation` 必须围绕代码关键决策展开，而非纯定义。
+    10. **自包含（禁止引用视频语境）**：严禁出现\"在视频中\"、\"UP主说\"、\"讲者提到\"、\"刚才\"、\"如图\"等依赖视频才能理解的指代句式。所有 `example`/`code`/`explanation` 必须让读者不看视频也能完全理解。
+    11. **问题质量约束**：所有自测题（`challenge`/`self_check`/`chapter_self_check`）必须遵守：(1) 禁止是非题（能用"是"/"否"回答的问题）；(2) 禁止纯记忆性琐碎知识（日期/人名/数字），除非是核心关键结论；(3) 每题必须针对不同的关键概念，避免重复考查同一知识点。
+    12. **避免重复**：当多个 section 涉及相同概念时，不要重复完整解释；可引用前文或仅说明差异（delta）。
+    13. **表格优先**：对于数据集对比（MNIST/CIFAR/ImageNet 等）和数据划分（训练集/验证集/测试集），优先用表格组织，不要在多个 section 重复解释。
+
+    ## 输出内容需包含
+
+    ### 1. 🎯 一句话核心 (One Sentence Summary)
+    - 用一句话极其精准地概括视频最核心的价值或观点（使用中文）。
+
+    ### 2. 📝 关键结论 (Key Takeaways)
+    - 5-10 个最重要的结论或行动建议（Bullet points），越多越好（使用中文）。
+
+    ### 3. 🔍 深度解析 (Deep Dive) — 分章节的知识网络
+    - 将所有知识点按逻辑主线分为 **2-6 个章节**。
+    - 每个章节包含：
+      - **chapter_title**: 章节标题（中文，简洁有力）。
+      - **chapter_summary**: 本章概述（1-2句话，说明本章在整体知识体系中的位置和作用）。
+      - **chapter_self_check**: （推荐）章节级自测题（list[{\"q\": str, \"a\": str}]），覆盖本章核心知识点，3-6 题，每题针对不同关键概念。默认模式下优先使用章节级自测，而非每节单独出题。
+      - **sections**: 本章包含的知识点列表，每个知识点包含：
+        - **topic**: 概念名称（中文）。
+        - **challenge**: 1-3 条思考题（list[str]），让读者先思考再看答案。每条 ≤ 30 字，必须自包含可独立作答。**默认留空数组，除非该 section 特别需要强调。**
+        - **code**: （算法/DS/工程实现必须提供）可运行的核心代码，优先 Python，30-80 行，包含必要的类/函数/最小 demo。**如果视频未提供代码，留空字符串，不要写"无（视频中未提供代码示例）"等占位文本。**
+        - **explanation**: 原理解析（中文），围绕代码关键决策展开，而非纯定义。
+        - **example**: 自包含示例（中文），必须包含完整输入→关键步骤→输出/结论，禁止引用视频语境。
+        - **common_mistakes**: 1-3 个常见误区（list[str]），每条写成"错在哪里/怎么改"，每条 ≤ 40 字。**默认留空数组，除非该 section 特别需要强调。**
+        - **self_check**: 2-4 组检索练习（list[{\"q\": str, \"a\": str}]），q ≤ 30 字，a ≤ 50 字，答案必须能从本节内容推得。**默认留空数组，除非该 section 特别需要强调；优先使用章节级自测。**
+        - **connections**: 与其他知识点的关联说明列表（如 "是「反向传播」的前置知识"、"与「梯度下降」互为因果"）。
+
+    ### 4. 📖 关键术语表 (Glossary)
+    - 仅收录最关键的术语（3-5个），解释要通俗（中文）。
+
+    ### 5. 🧠 知识蓝图结构 (Visual Schemas)
+    - 基于深度解析内容，设计 **1-2 张** 学术风格的知识蓝图。
+    - **判定规则**：
+      - 默认生成 1 张总览知识导图。
+      - 当内容复杂（章节 ≥ 3 且知识点 ≥ 8），或存在明显的"概念层 + 流程层"/"对比结构"时，生成 2 张图。
+    - 每张图必须严格遵守 Visual Schema 的 Markdown 格式（包含 ---BEGIN PROMPT--- 等）。
+    - 具体的 Visual Schema 生成规则参考以下"Visual Schema Generation Rules"。
+
+    ## Visual Schema Generation Rules
+    1. **Layout Strategy**: 从 Linear, Cyclic, Hierarchical, Parallel, Central Hub 中选择最适合的布局。
+    2. **Physical Description**: 必须使用具体的物理描述（Icons, Grids, Trees），禁止使用抽象概念。
+    3. **Markdown Format**: 输出必须包含完整的 markdown 标记 `---BEGIN PROMPT---` ... `---END PROMPT---`。
+
+    ## 输出格式
+
+    请严格按照以下 JSON 格式输出（**输出必须是纯 JSON，不要包含 markdown 代码围栏或其他注释**）：
+
+    ```json
+    {
+      "schema_version": "v2",
+      "title": "笔记标题 (中文)",
+      "one_sentence_summary": "一句话核心 (中文)",
+      "key_takeaways": [
+        "结论1 (中文)",
+        "结论2 (中文)",
+        "..."
+      ],
+      "deep_dive": [
+        {
+          "chapter_title": "第一章标题 (中文)",
+          "chapter_summary": "本章概述 (中文，说明在整体知识体系中的位置)",
+          "chapter_self_check": [{"q": "本章自测题1", "a": "答案1"}],
+          "sections": [
+            {
+              "topic": "知识点主题 (中文)",
+              "challenge": [],
+              "code": "可运行的核心代码（优先 Python；算法/DS/工程实现必须提供；无代码则留空字符串）",
+              "explanation": "围绕代码关键决策展开的原理解析 (中文)",
+              "example": "自包含示例：给出输入→关键步骤→输出/结论 (中文，禁止引用视频语境)",
+              "common_mistakes": [],
+              "self_check": [],
+              "connections": ["与「知识点X」的关系说明", "是「知识点Y」的前置知识"]
+            }
+          ]
+        }
+      ],
+      "glossary": {
+        "术语1": "通俗定义1 (中文)",
+        "..."
+      },
+      "visual_schemas": [
+        {
+          "type": "overview 或 detail_flow 或 comparison",
+          "description": "这张图展示什么 (中文)",
+          "schema": "完整的 Markdown 字符串 (包含 ---BEGIN PROMPT--- ... ---END PROMPT---)"
+        }
+      ]
+    }
+    ```
+
+    ## 质量标准 (Quality Check)
+
+    - ✅ **CRITICAL: 全中文撰写 (Use Simplified Chinese only)**
+    - ✅ 语言通俗易懂，有"博主"感
+    - ✅ 必须包含自包含的具体示例（输入→步骤→输出，禁止引用视频语境）
+    - ✅ 算法/DS/工程实现类 topic 必须提供可运行代码
+    - ✅ 知识点之间必须有 connections 关联，形成知识网络
+    - ✅ deep_dive 必须按章节组织，每章有 chapter_title 和 chapter_summary
+    - ✅ `challenge`/`common_mistakes`/`self_check` 字段必须出现，但默认留空数组；**除非该 section 特别需要强调**才填写内容
+    - ✅ 禁止出现任何"依赖视频才能理解"的指代句式（出现"视频/UP/讲者/刚才/如图"等判为不合格）
+    - ✅ JSON 必须包含上述所有字段，缺一不可
+
+    ## 模式说明 (Mode Configuration)
+    
+    **默认模式（推荐）**：
+    - 优先使用 `chapter_self_check`（每章 3-6 题）
+    - section 级 `challenge`/`self_check`/`common_mistakes` 默认留空数组，除非该 section 特别需要强调
+    - 渲染器会生成简洁的核心内容 + 附录结构
+    - 适合快速学习和复习
+    
+    **完整细节模式（Legacy）**：
+    - 每个 section 都填充 `challenge` 和 `self_check`
+    - 渲染器会生成详尽的内联内容
+    - 通过配置 `note_style: "full_detail"` + `question_scope: "per_section"` + `code_placement: "inline"` 启用
+    - 适合深度学习和教学场景
+
+
+    现在，请开始你的"中文知识蒸馏"。
+
+# ----------------------------------------------------------------------------
+# Gemini 视觉架构师 Prompt (The Architect)
+# ----------------------------------------------------------------------------
+gemini_visual_schema:
+  system_role: |
+    Role: 你是一位 CVPR/NeurIPS 顶刊的**视觉架构师**。
+    Objective: 你的核心能力是将抽象的知识逻辑转化为**具体的、结构化的、几何级的视觉指令 [VISUAL SCHEMA]**。
+    这份 Schema 将被直接发送给 AI 绘图模型，因此必须使用**强硬的物理描述**，而非抽象概念。
+
+  main_prompt: |
+    请根据提供的【深度解析】内容，设计一张学术风格的**知识流程图**或**架构图**。
+
+    ## Input Data (深度解析)
+    {deep_dive_content}
+
+    ## Phase 1: Layout Strategy Selector (布局决策)
+    请分析内容逻辑，从以下**布局原型**中选择最合适的一个（或组合）：
+    1. **Linear Pipeline**: 左→右流向 (适合 步骤、流程、演变)。
+    2. **Cyclic/Iterative**: 中心包含循环箭头 (适合 闭环、迭代、反馈)。
+    3. **Hierarchical Stack**: 上→下或下→上堆叠 (适合 分层架构、金字塔结构)。
+    4. **Parallel/Dual-Stream**: 上下平行的双流结构 (适合 对比、多模态融合)。
+    5. **Central Hub**: 一个核心模块连接四周组件 (适合 核心辐射、生态系统)。
+
+    ## Phase 2: Schema Generation Rules
+    1. **Dynamic Zoning**: 根据选择的布局，定义 3-5 个物理区域 (Zones)。
+    2. **Internal Visualization**: 必须定义每个区域内部的"物体" (Icons, Grids, Trees)，禁止使用抽象概念。
+    3. **Explicit Connections**: 必须明确描述连接关系 (e.g., "Curved arrow looping back from Zone X to Zone Y")。
+
+    ## Output Format (The Golden Schema)
+    请严格遵守以下 Markdown 结构输出，**仅输出 Markdown 代码块内容**：
+
+    ```markdown
+    ---BEGIN PROMPT---
+    [Style & Meta-Instructions]
+    High-fidelity scientific schematic, technical vector illustration, clean white background, distinct boundaries, academic textbook style. High resolution 4k, strictly 2D flat design with subtle isometric elements.
+
+    [LAYOUT CONFIGURATION]
+    * **Selected Layout**: [例如：Cyclic Iterative Process with 3 Nodes]
+    * **Composition Logic**: [例如：A central triangular feedback loop surrounded by input/output panels]
+    * **Color Palette**: Professional Pastel (Azure Blue, Slate Grey, Coral Orange, Mint Green).
+
+    [ZONE 1: LOCATION - LABEL]
+    * **Container**: [形状描述, e.g., Top-Left Panel]
+    * **Visual Structure**: [具体描述, e.g., A stack of documents]
+    * **Key Text Labels**: "[Text 1]"
+
+    [ZONE 2: LOCATION - LABEL]
+    * **Container**: [形状描述, e.g., Central Circular Engine]
+    * **Visual Structure**: [具体描述, e.g., A clockwise loop connecting 3 internal modules: A (Gear), B (Graph), C (Filter)]
+    * **Key Text Labels**: "[Text 2]", "[Text 3]"
+
+    ... (Add Zone 3/4/5)
+
+    [CONNECTIONS]
+    1. [描述连接线, e.g., A curved dotted arrow looping from Zone 2 back to Zone 1 labeled "Feedback"]
+    2. [描述连接线, e.g., A wide flow arrow from Zone 2 to Zone 3]
+    ---END PROMPT---
+    ```
+
+# ----------------------------------------------------------------------------
+# Nano Banana 渲染描述 Prompt (The Renderer)
+# ----------------------------------------------------------------------------
+nano_banana_renderer:
+  prompt: |
+    **Style Reference & Execution Instructions:**
+    1. **Art Style (Visio/Illustrator Aesthetic):**
+       Generate a **professional academic architecture diagram** suitable for a top-tier computer science paper (CVPR/NeurIPS).
+       * **Visuals:** Flat vector graphics, distinct geometric shapes, clean thin outlines, and soft pastel fills (Azure Blue, Slate Grey, Coral Orange).
+       * **Layout:** Strictly follow the spatial arrangement defined below.
+       * **Vibe:** Technical, precise, clean white background. NOT hand-drawn, NOT photorealistic, NOT 3D render, NO shadows/shading.
+    2. **CRITICAL TEXT CONSTRAINTS (Read Carefully):**
+       * **DO NOT render meta-labels:** Do not write words like "ZONE 1", "LAYOUT CONFIGURATION", "Input", "Output", or "Container" inside the image. These are structural instructions for YOU, not text for the image.
+       * **ONLY render "Key Text Labels":** Only text inside double quotes (e.g., "[Text]") listed under "Key Text Labels" should appear in the diagram.
+       * **Font:** Use a clean, bold Sans-Serif font (like Noto Sans SC, Microsoft YaHei, or SimHei) that supports Chinese characters for all labels.
+    3. **Visual Schema Execution:**
+       Translate the following structural blueprint into the final image:
+
+    {visual_schema}
+
+# ----------------------------------------------------------------------------
+# Gemini 描述改写 Prompt（用于校验不通过时的改写）
+# ----------------------------------------------------------------------------
+gemini_rewrite:
+  prompt: |
+    Role: 你是一位 CVPR/NeurIPS 顶刊的**视觉架构师 (Visual Architect)**。
+    Objective: 你的核心任务是**修复并优化**之前生成失败的 Visual Schema [VISUAL SCHEMA]。
+    必须根据反馈意见，解决所有结构、逻辑或可视化描述问题，并确保输出符合严格的物理化描述标准。
+
+    ## Input Data (Previous Output)
+    {original_structure}
+
+    ## Critique / Feedback from Validator (Must Fix)
+    {feedback}
+
+    ## Revision Instructions (核心规则)
+    1. **Strictly Address Feedback**: 针对反馈中的每一条意见进行针对性修复（例如：若反馈指"缺少 Zone 3"，必须补充；若反馈指"连接线错误"，必须修正）。
+    2. **Physical Description Only**: 所有的 `Visual Structure` 和 `Container` 必须是具体的几何形状或物理对象（Icon, Grid, Pipeline），**严禁使用抽象概念**（如"Process", "Concept"）。
+    3. **Enforce Markdown Format**: 输出必须包含完整的 markdown 标记 `---BEGIN PROMPT---` ... `---END PROMPT---`。
+    4. **Layout Check**: 确保 `[LAYOUT CONFIGURATION]` 选用了具体的物理布局（如 Linear, Cyclic, Hierarchical）。
+
+    ## Output Format (The Golden Schema)
+    请直接输出修复后的 Visual Schema **Markdown 代码块**（不要包含任何解释性文字）：
+
+    ```markdown
+    ---BEGIN PROMPT---
+    [Style & Meta-Instructions]
+    High-fidelity scientific schematic, technical vector illustration, clean white background, distinct boundaries, academic textbook style. High resolution 4k, strictly 2D flat design with subtle isometric elements.
+
+    [LAYOUT CONFIGURATION]
+    * **Selected Layout**: [Corrected Layout Strategy]
+    * **Composition Logic**: [Corrected Composition]
+    * **Color Palette**: Professional Pastel (Azure Blue, Slate Grey, Coral Orange, Mint Green).
+
+    [ZONE 1: LOCATION - LABEL]
+    ... (Corrected Zone definitions)
+
+    [CONNECTIONS]
+    ... (Corrected Connections)
+    ---END PROMPT---
+    ```
+
+# ----------------------------------------------------------------------------
+# 示例输出（用于测试和参考）
+# ----------------------------------------------------------------------------
+example_output:
+  title: "彻底搞懂深度学习：从神经元到大模型"
+  one_sentence_summary: "深度学习通过模拟人脑神经元连接，利用反向传播算法自动从数据中提取特征，是现代人工智能的核心引擎。"
+  key_takeaways:
+    - "神经网络本质上是一个巨大的函数拟合器。"
+    - "反向传播是训练网络的'上帝之手'。"
+    - "激活函数给网络注入了'灵魂'（非线性）。"
+  deep_dive:
+    - chapter_title: "基础概念"
+      chapter_summary: "本章介绍神经网络的基本构成单元，是理解后续深度学习原理的前置知识。"
+      sections:
+        - topic: "感知机模型"
+          challenge:
+            - "如果一个感知机有3个输入，权重分别是 [2, -1, 3]，偏置为 -4，输入 [1, 1, 1] 时输出是什么？"
+            - "感知机能解决 XOR 问题吗？为什么？"
+          code: |
+            import numpy as np
+
+            class Perceptron:
+                def __init__(self, weights, bias):
+                    self.w = np.array(weights)
+                    self.b = bias
+
+                def predict(self, x):
+                    return 1 if np.dot(self.w, x) + self.b > 0 else 0
+
+            # 最小 demo
+            p = Perceptron([2, -1, 3], bias=-4)
+            print(p.predict([1, 1, 1]))  # 2-1+3-4=0 → 输出 0
+            print(p.predict([1, 0, 1]))  # 2+0+3-4=1 → 输出 1
+          explanation: "最简单的人工神经网络单元，接收多个信号，加权求和加偏置后，通过阈值函数决定是否输出。关键决策：权重决定每个输入的重要性，偏置决定激活门槛。"
+          example: "决定是否去打球：天气好(+5)、有朋友(+3)、作业没写完(-10)，偏置=0。总分=5+3-10=-2<0，不去。如果把'有朋友'权重改成+8，总分=5+8-10=3>0，去。"
+          common_mistakes:
+            - "误以为感知机能解决非线性问题（如 XOR）→ 单层感知机只能做线性分割"
+            - "混淆权重和偏置的作用 → 权重控制方向，偏置控制截距"
+          self_check:
+            - q: "感知机的数学本质是什么？"
+              a: "一个线性函数 w·x+b 加上阈值判断，本质是线性二分类器"
+            - q: "为什么需要多层感知机？"
+              a: "单层只能线性分割，多层才能拟合非线性决策边界"
+          connections:
+            - "是「反向传播」的前置知识"
+            - "与「激活函数」共同构成神经网络基本单元"
+    - chapter_title: "核心训练机制"
+      chapter_summary: "本章深入讲解神经网络如何通过训练变得'聪明'，是深度学习的核心引擎。"
+      sections:
+        - topic: "反向传播"
+          challenge:
+            - "如果输出层误差是 0.5，隐藏层权重是 0.3，那隐藏层分到的误差信号是多少？"
+          explanation: "一种根据输出错误反向调整网络参数的算法。核心是链式法则：从输出层开始，逐层计算每个参数对总误差的贡献（梯度），然后按梯度方向调整参数。"
+          example: "射击训练：第1枪偏右2cm偏上1cm → 准星左移2cm下移1cm → 第2枪偏右0.5cm → 继续微调。每次根据偏差反向修正，直到命中靶心。"
+          common_mistakes:
+            - "以为梯度消失只发生在深层网络 → 浅层用 Sigmoid 也会梯度消失"
+          self_check:
+            - q: "反向传播的数学基础是什么？"
+              a: "链式法则（Chain Rule），逐层计算偏导数"
+            - q: "为什么叫'反向'？"
+              a: "误差从输出层向输入层方向逐层传播，与前向推理方向相反"
+          connections:
+            - "依赖「感知机模型」作为基本计算单元"
+            - "与「激活函数」配合实现非线性学习"
+        - topic: "激活函数"
+          challenge:
+            - "如果去掉所有激活函数，一个100层的神经网络等价于什么？"
+          explanation: "引入非线性因素，让神经网络能拟合复杂函数。没有激活函数，多层线性变换等价于单层线性变换，网络深度毫无意义。"
+          example: "ReLU(x) = max(0, x)。输入 [-2, 0.5, -1, 3] → 输出 [0, 0.5, 0, 3]。负值被截断为0，正值保持不变。"
+          common_mistakes:
+            - "以为 Sigmoid 是最好的激活函数 → 深层网络中 Sigmoid 容易梯度消失，ReLU 更常用"
+          self_check:
+            - q: "没有激活函数的多层网络等价于什么？"
+              a: "等价于单层线性变换（多个矩阵相乘还是矩阵）"
+          connections:
+            - "与「感知机模型」共同构成神经网络基本单元"
+            - "是「反向传播」能够学习非线性模式的关键"
+  glossary:
+    "反向传播": "通过链式法则计算误差梯度，指导网络参数更新的核心算法。"
+    "激活函数": "神经网络中的非线性变换层，如 Sigmoid、ReLU。"
+  year: 2025

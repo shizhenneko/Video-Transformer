@@ -26,6 +26,20 @@ def _coerce_int(value: object, default: int) -> int:
     return default
 
 
+def _coerce_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return default
+
+
 def _estimate_segments(duration: float, segment_duration: int, overlap: int) -> int:
     if duration <= 0:
         return 0
@@ -40,11 +54,20 @@ def _estimate_segments(duration: float, segment_duration: int, overlap: int) -> 
 
 
 def _estimate_calls(
-    num_segments: int, max_continuations: int, retry_buffer: int
+    num_segments: int,
+    max_continuations: int,
+    retry_buffer: int,
+    extra_calls: int = 0,
 ) -> int:
     if num_segments <= 0:
         return 0
-    return num_segments + 1 + (num_segments * max_continuations) + retry_buffer
+    return (
+        num_segments
+        + 1
+        + extra_calls
+        + (num_segments * max_continuations)
+        + retry_buffer
+    )
 
 
 def plan_segments_with_budget(
@@ -72,6 +95,7 @@ def plan_segments_with_budget(
     max_continuations = _coerce_int(analyzer_config.get("max_continuations"), 3)
     retry_buffer = _coerce_int(analyzer_config.get("retry_times"), 0)
     duration_threshold = long_video_config.get("duration_threshold_seconds")
+    consolidate_enabled = _coerce_bool(long_video_config.get("consolidate"), True)
 
     duration = max(float(duration), 0.0)
     available_calls = max(hard_max_calls - int(current_api_count), 0)
@@ -102,16 +126,22 @@ def plan_segments_with_budget(
         overlap = max(min(overlap, segment_duration - 1), 0)
 
     num_segments = _estimate_segments(duration, segment_duration, overlap)
-    estimated_calls = _estimate_calls(num_segments, max_continuations, retry_buffer)
+    extra_calls = 1 if consolidate_enabled else 0
+    estimated_calls = _estimate_calls(
+        num_segments, max_continuations, retry_buffer, extra_calls
+    )
 
     if estimated_calls > available_calls:
         overlap = 0
         num_segments = _estimate_segments(duration, segment_duration, overlap)
-        estimated_calls = _estimate_calls(num_segments, max_continuations, retry_buffer)
+        estimated_calls = _estimate_calls(
+            num_segments, max_continuations, retry_buffer, extra_calls
+        )
 
     if estimated_calls > available_calls and available_calls > 0:
         per_segment_calls = 1 + max_continuations
-        max_segments = (available_calls - 1 - retry_buffer) // per_segment_calls
+        overhead_calls = 1 + extra_calls + retry_buffer
+        max_segments = (available_calls - overhead_calls) // per_segment_calls
         if max_segments < 1:
             return SegmentPlan(
                 segment_duration=0,
@@ -127,7 +157,9 @@ def plan_segments_with_budget(
         segment_duration = max(int(math.ceil(duration / max_segments)), min_segment, 1)
         overlap = 0
         num_segments = _estimate_segments(duration, segment_duration, overlap)
-        estimated_calls = _estimate_calls(num_segments, max_continuations, retry_buffer)
+        estimated_calls = _estimate_calls(
+            num_segments, max_continuations, retry_buffer, extra_calls
+        )
 
         while estimated_calls > available_calls and max_segments > 1:
             max_segments -= 1
@@ -136,7 +168,7 @@ def plan_segments_with_budget(
             )
             num_segments = _estimate_segments(duration, segment_duration, overlap)
             estimated_calls = _estimate_calls(
-                num_segments, max_continuations, retry_buffer
+                num_segments, max_continuations, retry_buffer, extra_calls
             )
 
         if estimated_calls > available_calls:

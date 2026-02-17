@@ -910,6 +910,16 @@ class ContentAnalyzer:
             raise RuntimeError("分段分析失败，未获得任何有效结果")
 
         merged = self._merge_segment_outputs(segment_outputs, gap_notes)
+        if long_video_config.get("consolidate", True):
+            if not self.api_counter.can_call():
+                self.logger.warning("API 配额不足以执行分段汇总，使用合并结果")
+            else:
+                try:
+                    consolidated = self._consolidate_segments(merged)
+                    if consolidated:
+                        merged = consolidated
+                except Exception as exc:
+                    self.logger.warning(f"分段汇总失败，使用合并结果: {exc}")
         metadata = {
             "video_name": video_path.name,
             "video_size": video_path.stat().st_size,
@@ -1025,6 +1035,96 @@ class ContentAnalyzer:
             merged["visual_schema"] = first_data.get("visual_schema", "")
 
         return merged
+
+    def _consolidate_segments(self, merged: dict[str, Any]) -> dict[str, Any] | None:
+        deep_dive = self._normalize_chapters(merged.get("deep_dive", []))
+        if not deep_dive:
+            self.logger.warning("分段汇总跳过：deep_dive 为空")
+            return None
+
+        merged_payload = {
+            "title": merged.get("title", ""),
+            "one_sentence_summary": merged.get("one_sentence_summary", ""),
+            "key_takeaways": merged.get("key_takeaways", []),
+            "deep_dive": deep_dive,
+            "glossary": merged.get("glossary", {}),
+        }
+
+        prompt = (
+            "You are consolidating merged video notes into conceptual chapters.\n"
+            "Input is JSON with keys: title, one_sentence_summary, key_takeaways, deep_dive, glossary.\n"
+            "Task: reorganize deep_dive into 2-6 conceptual chapters by topic similarity, not time range.\n"
+            "Hard constraints:\n"
+            "- Output JSON only, no markdown, no extra text.\n"
+            "- Preserve ALL unique section topics from the input. Do not drop or invent topics.\n"
+            "- Deduplicate repeated concepts while keeping every topic represented exactly once.\n"
+            "- Keep the same schema (title, one_sentence_summary, key_takeaways, deep_dive, glossary).\n"
+            "- Prefer chapter-level self-check only; do not add per-section self-check blocks.\n"
+            "- Keep existing timestamps as-is; do not fabricate new time ranges.\n"
+            "Return JSON that satisfies the schema and constraints.\n\n"
+            f"INPUT_JSON:\n{json.dumps(merged_payload, ensure_ascii=False)}"
+        )
+
+        response_text = self._call_gemini_text_api(
+            system_role="",
+            user_prompt=prompt,
+            temperature=0.2,
+            max_output_tokens=8192,
+        )
+        response_text = response_text.strip()
+        if not response_text:
+            self.logger.warning("分段汇总失败：响应为空")
+            return None
+
+        json_match = re.search(r"```json\s*(\{.*?\})\s*```", response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(1)
+        else:
+            code_block_match = re.search(
+                r"```\s*(\{.*?\})\s*```", response_text, re.DOTALL
+            )
+            if code_block_match:
+                response_text = code_block_match.group(1)
+            else:
+                start_idx = response_text.find("{")
+                end_idx = response_text.rfind("}")
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    response_text = response_text[start_idx : end_idx + 1]
+
+        cleaned_text, stripped_count = self._strip_stray_token_prefixes(response_text)
+        if stripped_count > 0:
+            self.logger.debug(
+                f"event=consolidate_json_stray_token_strip count={stripped_count}"
+            )
+        parsed = self._try_repair_json(cleaned_text)
+        if not isinstance(parsed, dict):
+            self.logger.warning("分段汇总失败：JSON 解析失败")
+            return None
+
+        required_fields = {
+            "title",
+            "one_sentence_summary",
+            "key_takeaways",
+            "deep_dive",
+            "glossary",
+        }
+        missing = required_fields - parsed.keys()
+        if missing:
+            self.logger.warning(f"分段汇总失败：缺少字段 {', '.join(sorted(missing))}")
+            return None
+
+        consolidated_chapters = self._normalize_chapters(parsed.get("deep_dive", []))
+        if not 2 <= len(consolidated_chapters) <= 6:
+            self.logger.warning("分段汇总失败：章节数量不在 2-6 范围内")
+            return None
+        parsed["deep_dive"] = consolidated_chapters
+
+        if "visual_schemas" in merged and "visual_schemas" not in parsed:
+            parsed["visual_schemas"] = merged.get("visual_schemas", [])
+        elif "visual_schema" in merged and "visual_schema" not in parsed:
+            parsed["visual_schema"] = merged.get("visual_schema", "")
+
+        return parsed
 
     def _generate_visual_schema(self, deep_dive_content: str) -> str:
         """根据深度解析内容生成 Visual Schema"""
