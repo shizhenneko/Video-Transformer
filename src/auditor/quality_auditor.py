@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from google import genai
-from google.genai import types
+import google.genai as genai  # type: ignore[reportMissingImports]
+from google.genai import types  # type: ignore[reportMissingImports]
 
 from utils.counter import APICounter, APILimitExceeded
 from utils.gemini_throttle import GeminiThrottle
@@ -41,8 +41,8 @@ class QualityAuditor:
         config: dict[str, Any],
         api_counter: APICounter,
         logger: logging.Logger,
+        throttle: GeminiThrottle,
         api_key: str | None = None,
-        throttle: GeminiThrottle | None = None,
     ):
         """
         初始化审核器
@@ -73,9 +73,10 @@ class QualityAuditor:
         self._client: genai.Client | None = None
 
         http_proxy = proxy_config.get("http")
-        
+
         if http_proxy:
             import os
+
             os.environ["HTTP_PROXY"] = http_proxy
             os.environ["HTTPS_PROXY"] = http_proxy
             os.environ["NO_PROXY"] = "localhost,127.0.0.1"
@@ -93,16 +94,7 @@ class QualityAuditor:
         self.logger.info("QualityAuditor 初始化完成")
 
         # 限流器
-        analyzer_config = config.get("analyzer", {})
-        min_interval = analyzer_config.get("min_call_interval", 4.0)
-        max_retry_wait = analyzer_config.get("max_retry_wait", 600.0)
-        max_retries = analyzer_config.get("retry_times", 10)
-        self.throttle = throttle or GeminiThrottle(
-            min_interval=min_interval,
-            max_retries=max_retries,
-            max_total_wait=max_retry_wait,
-            logger=logger,
-        )
+        self.throttle = throttle
 
     # _allocate_key_from_pool 已移除,密钥分配逻辑已移至 VideoPipeline
 
@@ -135,6 +127,15 @@ class QualityAuditor:
             )
         except requests.RequestException as e:
             self.logger.warning(f"向号池报告错误失败: {e}")
+
+    @staticmethod
+    def _classify_429_is_daily(exc: Exception) -> bool:
+        """仅在异常明确提示每日配额耗尽时返回 True。"""
+        message = str(exc).lower()
+        if not message:
+            return False
+        daily_markers = ("per day", "daily", "quota exceeded per day")
+        return any(marker in message for marker in daily_markers)
 
     def _delete_remote_file(self, file_name: str) -> None:
         """删除 Gemini Files 存储中的远程文件，释放配额空间。"""
@@ -181,12 +182,15 @@ class QualityAuditor:
         if not self._client:
             raise RuntimeError("Gemini Client 未初始化 (缺少 API Key)")
 
+        client = self._client
+
         # 在重试循环外部上传图片（只 upload 一次）
         self.logger.info(f"上传图片: {image_path.name}")
         self.throttle.wait_for_files_op()
-        image_file = self._client.files.upload(file=str(image_path))
+        image_file = client.files.upload(file=str(image_path))
 
         try:
+
             def _do_audit() -> AuditResult:
                 """单次审核 API 调用（图片已在外部 upload）"""
                 prompt = self._build_audit_prompt(knowledge_doc_content)
@@ -196,7 +200,7 @@ class QualityAuditor:
                 response_parts: list[str] = []
                 thinking_logged = False
 
-                for chunk in self._client.models.generate_content_stream(
+                for chunk in client.models.generate_content_stream(
                     model=self.model_name,
                     contents=[
                         {
@@ -218,12 +222,15 @@ class QualityAuditor:
                         thinking_config=types.ThinkingConfig(
                             thinking_budget=4096,
                         ),
-                        http_options={"timeout": 600_000},
+                        http_options=types.HttpOptions(timeout=600_000),
                     ),
                 ):
                     if not chunk.candidates:
                         continue
-                    for part in chunk.candidates[0].content.parts:
+                    content = chunk.candidates[0].content
+                    if not content or not content.parts:
+                        continue
+                    for part in content.parts:
                         if part.thought:
                             if not thinking_logged:
                                 self.logger.info("💭 Gemini 审核思考中...")
@@ -248,8 +255,14 @@ class QualityAuditor:
                 return self._parse_audit_response(response_text)
 
             def _on_retry(attempt: int, exc: Exception) -> None:
-                self._report_error_to_pool(is_rpd_limit=True)
+                nonlocal reported_retry
+                if reported_retry:
+                    return
+                reported_retry = True
+                is_daily_limit = self._classify_429_is_daily(exc)
+                self._report_error_to_pool(is_rpd_limit=is_daily_limit)
 
+            reported_retry = False
             return self.throttle.call_with_retry(
                 _do_audit,
                 on_retry_callback=_on_retry,

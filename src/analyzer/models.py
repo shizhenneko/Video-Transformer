@@ -9,6 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import warnings
+
+from .validators import detect_stub_output, validate_markdown_structure
 
 
 @dataclass
@@ -73,6 +76,9 @@ class KnowledgeDocument:
             格式化的 Markdown 文档字符串
         """
         self_check_mode = self._normalize_self_check_mode(self_check_mode)
+
+        if self_check_mode == "default":
+            return self._to_markdown_default(image_paths)
 
         lines = [
             f"# {self.title}",
@@ -174,6 +180,145 @@ class KnowledgeDocument:
 
         return "\n".join(lines)
 
+    def _to_markdown_default(self, image_paths: list[str] | None) -> str:
+        lines = [
+            f"# {self.title}",
+            "",
+            "> 🎯 **一句话核心**",
+            f"> {self.one_sentence_summary}",
+            "",
+            "## 📝 关键结论 (Key Takeaways)",
+            "",
+        ]
+
+        for point in self.key_takeaways:
+            lines.append(f"- {point}")
+        lines.append("")
+
+        if image_paths:
+            lines.extend(
+                [
+                    "## 🖼️ 核心图解 (Visual Architecture)",
+                    "",
+                ]
+            )
+            for idx, img_path in enumerate(image_paths):
+                desc = ""
+                if idx < len(self.visual_schemas):
+                    desc = self.visual_schemas[idx].description
+                label = desc if desc else f"知识蓝图 {idx + 1}"
+                lines.append(f"**{label}**")
+                lines.append("")
+                lines.append(f"![{label}]({img_path})")
+                lines.append("")
+
+        lines.extend(
+            [
+                "## 🔍 深度解析 (Deep Dive)",
+                "",
+            ]
+        )
+
+        chapter_num = 0
+        global_section_num = 0
+        appendix_lines: list[str] = []
+        coverage_lines: list[str] = []
+
+        chapters: list[dict[str, Any]] = []
+        if any("chapter_title" in item for item in self.deep_dive):
+            chapters = self.deep_dive
+        else:
+            chapters = [
+                {
+                    "chapter_title": "核心要点",
+                    "chapter_summary": "",
+                    "sections": self.deep_dive,
+                }
+            ]
+
+        for chapter in chapters:
+            chapter_num += 1
+            chapter_title = chapter.get("chapter_title", f"第{chapter_num}章")
+            chapter_summary = chapter.get("chapter_summary", "")
+            sections = chapter.get("sections", [])
+
+            lines.append(f"### 第{chapter_num}章：{chapter_title}")
+            lines.append("")
+            if chapter_summary:
+                lines.append(f"> {chapter_summary}")
+                lines.append("")
+
+            coverage_lines.append(f"- 第{chapter_num}章：{chapter_title}")
+
+            chapter_questions: list[dict[str, str]] = []
+
+            appendix_lines.append(f"### 第{chapter_num}章：{chapter_title}")
+            appendix_lines.append("")
+            if chapter_summary:
+                appendix_lines.append(f"> {chapter_summary}")
+                appendix_lines.append("")
+
+            for section in sections:
+                global_section_num += 1
+                self._render_section_compact(lines, global_section_num, section)
+                appendix_lines.extend(
+                    self._render_section_appendix(global_section_num, section)
+                )
+
+                topic = section.get("topic", "未知主题")
+                coverage_lines.append(f"- {topic}")
+
+                raw_self_check = section.get("self_check", [])
+                if isinstance(raw_self_check, list):
+                    for item in raw_self_check:
+                        if isinstance(item, dict) and "q" in item and "a" in item:
+                            chapter_questions.append(item)
+
+            if chapter_questions:
+                lines.append(f"### 📋 第{chapter_num}章自测")
+                lines.append("")
+                for idx, qa in enumerate(chapter_questions, 1):
+                    label = f"Q{chapter_num}.{idx}"
+                    question_text = str(qa["q"]).strip()
+                    answer_text = str(qa["a"]).strip()
+                    lines.append(f"- {label}：{question_text}")
+                    lines.append(f"- {label} -> 答案：{answer_text}")
+                lines.append("")
+
+        lines.extend(
+            [
+                "## 📌 覆盖清单 (Coverage Index)",
+                "",
+            ]
+        )
+        lines.extend(coverage_lines)
+        lines.append("")
+
+        lines.extend(
+            [
+                "## 📎 附录 (Appendix)",
+                "",
+            ]
+        )
+        if appendix_lines:
+            lines.extend(appendix_lines)
+        else:
+            lines.append("- （无附录内容）")
+        lines.append("")
+
+        if self.glossary:
+            lines.extend(
+                [
+                    "## 📖 关键术语表 (Glossary)",
+                    "",
+                ]
+            )
+            for term, definition in self.glossary.items():
+                lines.append(f"- **{term}**: {definition}")
+            lines.append("")
+
+        return "\n".join(lines)
+
     @staticmethod
     def _coerce_list(val: Any) -> list[Any]:
         """将值强制转换为列表（容错 Gemini 偶发类型偏差）"""
@@ -182,6 +327,115 @@ class KnowledgeDocument:
         if isinstance(val, str) and val.strip():
             return [line.strip() for line in val.split("\n") if line.strip()]
         return []
+
+    @staticmethod
+    def _format_timestamp_for_display(section: dict[str, Any]) -> str:
+        """
+        从 section 提取并格式化时间戳用于显示
+
+        Args:
+            section: 包含时间戳信息的 section 字典
+
+        Returns:
+            格式化的时间戳字符串，如 "(00:12:34–00:13:10)" 或 "(00:12:34)"，
+            如果没有时间戳则返回空字符串
+        """
+        import re
+
+        def parse_time_value(value: Any) -> float | None:
+            """解析时间值为秒数"""
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                num = float(value)
+                if num > 1000:
+                    return num / 1000.0
+                return num
+            raw = str(value).strip()
+            if not raw:
+                return None
+            try:
+                num = float(raw)
+                if num > 1000:
+                    return num / 1000.0
+                return num
+            except ValueError:
+                pass
+            if ":" in raw:
+                parts = raw.split(":")
+                if len(parts) == 3:
+                    hours, minutes, seconds = parts
+                elif len(parts) == 2:
+                    hours = "0"
+                    minutes, seconds = parts
+                else:
+                    return None
+                try:
+                    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                except ValueError:
+                    return None
+            return None
+
+        def parse_time_range(value: Any) -> tuple[float | None, float | None]:
+            """解析时间范围"""
+            if isinstance(value, dict):
+                start = parse_time_value(
+                    value.get("start") or value.get("start_time") or value.get("begin")
+                )
+                end = parse_time_value(
+                    value.get("end") or value.get("end_time") or value.get("finish")
+                )
+                return start, end
+            if isinstance(value, str):
+                matches = re.findall(r"\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2}", value)
+                if not matches:
+                    return parse_time_value(value), None
+                if len(matches) == 1:
+                    return parse_time_value(matches[0]), None
+                start = parse_time_value(matches[0])
+                end = parse_time_value(matches[1])
+                return start, end
+            start = parse_time_value(value)
+            return start, None
+
+        def format_seconds(seconds: float) -> str:
+            """将秒数格式化为 HH:MM:SS"""
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        # 尝试从多个可能的键提取时间戳
+        start_time: float | None = None
+        end_time: float | None = None
+
+        # 优先检查 timestamp/time_range/timecode/time 字段
+        for key in ("timestamp", "time_range", "timecode", "time"):
+            if key in section:
+                start_time, end_time = parse_time_range(section.get(key))
+                if start_time is not None or end_time is not None:
+                    break
+
+        # 如果没找到，检查 start_time/end_time 字段
+        if start_time is None and end_time is None:
+            start_time = parse_time_value(
+                section.get("start_time")
+                or section.get("start")
+                or section.get("begin")
+            )
+            end_time = parse_time_value(
+                section.get("end_time") or section.get("end") or section.get("finish")
+            )
+
+        # 格式化输出
+        if start_time is not None and end_time is not None:
+            return f"({format_seconds(start_time)}–{format_seconds(end_time)})"
+        elif start_time is not None:
+            return f"({format_seconds(start_time)})"
+        elif end_time is not None:
+            return f"({format_seconds(end_time)})"
+
+        return ""
 
     @staticmethod
     def _render_section(
@@ -212,7 +466,11 @@ class KnowledgeDocument:
 
         use_v2 = bool(challenge or self_check or common_mistakes)
 
-        lines.append(f"#### {num}. {topic}")
+        timestamp_str = KnowledgeDocument._format_timestamp_for_display(section)
+        if timestamp_str:
+            lines.append(f"#### {num}. {topic} {timestamp_str}")
+        else:
+            lines.append(f"#### {num}. {topic}")
 
         if use_v2:
             # === v2: 主动学习格式 ===
@@ -305,9 +563,83 @@ class KnowledgeDocument:
         return []
 
     @staticmethod
+    def _render_section_compact(
+        lines: list[str],
+        num: int,
+        section: dict[str, Any],
+    ) -> None:
+        topic = section.get("topic", "未知主题")
+        explanation = section.get("explanation", "")
+        example = section.get("example", "")
+
+        timestamp_str = KnowledgeDocument._format_timestamp_for_display(section)
+        if timestamp_str:
+            lines.append(f"#### {num}. {topic} {timestamp_str}")
+        else:
+            lines.append(f"#### {num}. {topic}")
+        lines.append("")
+        if explanation:
+            lines.append("**💡 原理解析**：")
+            lines.append(f"{explanation}")
+            lines.append("")
+        if example:
+            lines.append("**🌰 示例**：")
+            lines.append(f"> {example}")
+            lines.append("")
+
+    @staticmethod
+    def _render_section_appendix(
+        num: int,
+        section: dict[str, Any],
+    ) -> list[str]:
+        lines: list[str] = []
+        topic = section.get("topic", "未知主题")
+        explanation = section.get("explanation", "")
+        example = section.get("example", "")
+        code = section.get("code", "")
+        connections = section.get("connections", [])
+        common_mistakes = KnowledgeDocument._coerce_list(
+            section.get("common_mistakes", [])
+        )
+
+        timestamp_str = KnowledgeDocument._format_timestamp_for_display(section)
+        if timestamp_str:
+            lines.append(f"#### {num}. {topic} {timestamp_str}")
+        else:
+            lines.append(f"#### {num}. {topic}")
+        lines.append("")
+
+        if explanation:
+            lines.append("**💡 原理拆解**：")
+            lines.append(f"{explanation}")
+            lines.append("")
+        if example:
+            lines.append("**🌰 自包含示例**：")
+            lines.append(f"> {example}")
+            lines.append("")
+        if code:
+            lines.append("**💻 完整代码**：")
+            lines.append("```python")
+            lines.append(f"{code}")
+            lines.append("```")
+            lines.append("")
+        if common_mistakes:
+            lines.append("**⚠️ 常见误区**：")
+            for mistake in common_mistakes:
+                lines.append(f"- {mistake}")
+            lines.append("")
+        if connections:
+            lines.append("**🔗 关联知识**：")
+            for conn in connections:
+                lines.append(f"- {conn}")
+            lines.append("")
+
+        return lines
+
+    @staticmethod
     def _normalize_self_check_mode(mode: str) -> str:
         normalized = (mode or "").strip().lower()
-        if normalized in {"static", "interactive", "questions_only"}:
+        if normalized in {"static", "interactive", "questions_only", "default"}:
             return normalized
         return "static"
 
@@ -350,10 +682,34 @@ class AnalysisResult:
         Returns:
             包含知识笔记和知识蓝图结构的完整 Markdown 文档
         """
-        return self.knowledge_doc.to_markdown(
+        markdown = self.knowledge_doc.to_markdown(
             image_paths=image_paths,
             self_check_mode=self_check_mode,
         )
+
+        normalized_mode = (self_check_mode or "").strip().lower()
+        if normalized_mode not in {
+            "static",
+            "interactive",
+            "questions_only",
+            "default",
+        }:
+            normalized_mode = "static"
+        errors: list[str] = []
+
+        if detect_stub_output(markdown):
+            errors.append("检测到疑似占位/空内容输出")
+
+        _, structure_errors = validate_markdown_structure(markdown, normalized_mode)
+        errors.extend(structure_errors)
+
+        if errors:
+            message = "Markdown 校验失败: " + "; ".join(errors)
+            if normalized_mode == "default":
+                raise ValueError(message)
+            warnings.warn(f"Markdown 校验警告(legacy 模式): {message}")
+
+        return markdown
 
     @classmethod
     def from_api_response(

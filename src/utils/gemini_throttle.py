@@ -5,11 +5,14 @@ Gemini API 限流器
 通过全局限流 + 智能重试，规避 Google API 的速率/配额限制。
 """
 
+import ast
+import json
 import logging
+import random
 import re
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Optional
 
 
 class GeminiThrottle:
@@ -30,7 +33,7 @@ class GeminiThrottle:
         files_interval: float = 3.0,
         max_retries: int = 10,
         max_total_wait: float = 600.0,
-        logger: logging.Logger | None = None,
+        logger: Optional[logging.Logger] = None,
     ):
         """
         Args:
@@ -56,7 +59,9 @@ class GeminiThrottle:
             elapsed = now - self._last_call_time
             if elapsed < self.min_interval:
                 wait = self.min_interval - elapsed
-                self.logger.info(f"⏳ 限流等待 {wait:.1f}s (最小间隔 {self.min_interval}s)...")
+                self.logger.info(
+                    f"⏳ 限流等待 {wait:.1f}s (最小间隔 {self.min_interval}s)..."
+                )
                 time.sleep(wait)
             self._last_call_time = time.time()
 
@@ -67,7 +72,9 @@ class GeminiThrottle:
             elapsed = now - self._last_call_time
             if elapsed < self.files_interval:
                 wait = self.files_interval - elapsed
-                self.logger.info(f"⏳ 文件操作限速等待 {wait:.1f}s (间隔 {self.files_interval}s)...")
+                self.logger.info(
+                    f"⏳ 文件操作限速等待 {wait:.1f}s (间隔 {self.files_interval}s)..."
+                )
                 time.sleep(wait)
             self._last_call_time = time.time()
 
@@ -75,7 +82,8 @@ class GeminiThrottle:
         self,
         func: Callable[..., Any],
         *args: Any,
-        on_retry_callback: Callable[[int, Exception], None] | None = None,
+        on_retry_callback: Optional[Callable[[int, Exception], None]] = None,
+        log_context: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -94,14 +102,20 @@ class GeminiThrottle:
             最后一次失败的异常 (如果重试耗尽)
         """
         total_waited = 0.0
-        last_error: Exception | None = None
+        last_error: Optional[Exception] = None
+        context = log_context or {}
+        endpoint = context.get("endpoint", "unknown")
+        model = context.get("model", "unknown")
+        key_id = context.get("key_id", "unknown")
 
         for attempt in range(1, self.max_retries + 1):
             # 主动限速
             self.wait_before_call()
 
             try:
-                self.logger.info(f"尝试调用 Gemini API (第 {attempt}/{self.max_retries} 次)")
+                self.logger.info(
+                    f"尝试调用 Gemini API (第 {attempt}/{self.max_retries} 次)"
+                )
                 result = func(*args, **kwargs)
                 return result
             except Exception as e:
@@ -113,8 +127,23 @@ class GeminiThrottle:
                     # 非限流错误，不在此层重试，直接抛出
                     raise
 
+                wait_time = self._extract_retry_delay(
+                    error_str, attempt=attempt, base_delay=30.0
+                )
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                error_type = type(e).__name__
                 self.logger.warning(
-                    f"⚠️ 429 限流 (第 {attempt}/{self.max_retries} 次): {error_str[:200]}"
+                    "⚠️ 429 detected | "
+                    f"timestamp={timestamp} | "
+                    f"endpoint={endpoint} | model={model} | key_id={key_id} | "
+                    f"attempt={attempt} | status_code=429 | "
+                    f"retry_after={wait_time:.1f} | delay={wait_time:.1f}s | "
+                    f"error_type={error_type} | error={error_str[:200]}"
+                )
+
+                self.logger.warning(
+                    f"⚠️ 429 Rate Limit | attempt={attempt}/{self.max_retries} | "
+                    + f"wait={wait_time:.1f}s | error={error_str[:300]}"
                 )
 
                 # 回调通知
@@ -124,9 +153,6 @@ class GeminiThrottle:
                 # 已达最大重试次数
                 if attempt >= self.max_retries:
                     break
-
-                # 计算等待时间
-                wait_time = self._extract_retry_delay(error_str, default=60.0 * attempt)
 
                 # 检查是否超过总等待上限
                 if total_waited + wait_time > self.max_total_wait:
@@ -167,7 +193,12 @@ class GeminiThrottle:
         return any(ind in lower for ind in indicators)
 
     @staticmethod
-    def _extract_retry_delay(error_str: str, default: float = 60.0) -> float:
+    def _extract_retry_delay(
+        error_str: str,
+        default: float = 60.0,
+        attempt: int = 1,
+        base_delay: float = 30.0,
+    ) -> float:
         """
         从错误信息中提取 API 建议的重试等待时间
 
@@ -177,14 +208,95 @@ class GeminiThrottle:
         """
         lower = error_str.lower()
 
-        # Pattern 1: "retry in Xs"
-        match = re.search(r"retry in (\d+(?:\.\d+)?)s", lower)
-        if match:
-            return float(match.group(1)) + 5.0  # 多等 5 秒缓冲
+        def coerce_seconds(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                stripped = value.strip()
+                match = re.match(r"^(\d+(?:\.\d+)?)s$", stripped)
+                if match:
+                    return float(match.group(1))
+                if stripped.replace(".", "", 1).isdigit():
+                    return float(stripped)
+            return None
 
-        # Pattern 2: "retrydelay.*Ns"
-        match = re.search(r"retrydelay.*?(\d+)s", lower)
-        if match:
-            return float(match.group(1)) + 5.0
+        def parse_retry_delay_value(value: Any) -> Optional[float]:
+            if isinstance(value, dict):
+                seconds = value.get("seconds")
+                nanos = value.get("nanos", 0)
+                if seconds is None:
+                    return None
+                return float(seconds) + float(nanos) / 1_000_000_000
+            return coerce_seconds(value)
 
-        return default
+        def find_retry_after(obj: Any) -> Optional[float]:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    key_lower = str(key).lower()
+                    if key_lower in {"retry-after", "retry_after", "retryafter"}:
+                        retry_after = coerce_seconds(value)
+                        if retry_after is not None:
+                            return retry_after
+                    if key_lower == "retrydelay":
+                        retry_delay = parse_retry_delay_value(value)
+                        if retry_delay is not None:
+                            return retry_delay
+                    nested = find_retry_after(value)
+                    if nested is not None:
+                        return nested
+            elif isinstance(obj, list):
+                for item in obj:
+                    nested = find_retry_after(item)
+                    if nested is not None:
+                        return nested
+            return None
+
+        retry_after = None
+        trimmed = error_str.strip()
+        if trimmed.startswith("{") or trimmed.startswith("["):
+            try:
+                retry_after = find_retry_after(json.loads(trimmed))
+            except json.JSONDecodeError:
+                try:
+                    retry_after = find_retry_after(ast.literal_eval(trimmed))
+                except (ValueError, SyntaxError):
+                    retry_after = None
+        if retry_after is None:
+            brace_start = error_str.find("{")
+            brace_end = error_str.rfind("}")
+            if brace_start != -1 and brace_end > brace_start:
+                candidate = error_str[brace_start : brace_end + 1]
+                try:
+                    retry_after = find_retry_after(json.loads(candidate))
+                except json.JSONDecodeError:
+                    try:
+                        retry_after = find_retry_after(ast.literal_eval(candidate))
+                    except (ValueError, SyntaxError):
+                        retry_after = None
+
+        if retry_after is None:
+            match = re.search(r"retry-after\s*[:=]\s*(\d+(?:\.\d+)?)s?", lower)
+            if match:
+                retry_after = float(match.group(1))
+
+        if retry_after is None:
+            match = re.search(r"retry in (\d+(?:\.\d+)?)s", lower)
+            if match:
+                retry_after = float(match.group(1))
+
+        if retry_after is None:
+            match = re.search(r"retrydelay.*?(\d+(?:\.\d+)?)s", lower)
+            if match:
+                retry_after = float(match.group(1))
+
+        wait_time = retry_after
+        if wait_time is None:
+            if attempt < 1 or base_delay <= 0:
+                wait_time = default
+            else:
+                wait_time = base_delay * (2**attempt)
+
+        # Add jitter to prevent thundering herd
+        wait_time = wait_time * (0.9 + random.random() * 0.2)
+
+        return max(wait_time, 0.0)

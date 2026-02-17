@@ -15,14 +15,23 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
-from google import genai
-from google.genai import types
+import google.genai as genai  # type: ignore[reportMissingImports]
+from google.genai import types  # type: ignore[reportMissingImports]
 import requests
 
 from utils.counter import APICounter, APILimitExceeded
 from utils.gemini_throttle import GeminiThrottle
+from utils.budget_planner import SegmentPlan, plan_segments_with_budget
+from utils.video_segmenter import (
+    extract_segment,
+    load_or_create_manifest,
+    save_manifest,
+    update_segment_status,
+)
+from utils.video_utils import probe_duration
 from analyzer.models import AnalysisResult
 from analyzer.prompt_loader import load_prompts, render_prompt
 
@@ -40,8 +49,8 @@ class ContentAnalyzer:
         config: dict[str, Any],
         api_counter: APICounter,
         logger: logging.Logger,
+        throttle: GeminiThrottle,
         api_key: str | None = None,
-        throttle: GeminiThrottle | None = None,
     ):
         """
         初始化内容分析器
@@ -61,19 +70,11 @@ class ContentAnalyzer:
         self.model_name = self.analyzer_config.get("model", "gemini-2.5-flash")
         self.temperature = self.analyzer_config.get("temperature", 0.7)
         self.max_output_tokens = self.analyzer_config.get("max_output_tokens", 65536)
-        self.retry_times = self.analyzer_config.get("retry_times", 10)
         self.timeout = self.analyzer_config.get("timeout", 120)
         self.max_continuations = self.analyzer_config.get("max_continuations", 3)
 
         # 限流器
-        min_interval = self.analyzer_config.get("min_call_interval", 4.0)
-        max_retry_wait = self.analyzer_config.get("max_retry_wait", 600.0)
-        self.throttle = throttle or GeminiThrottle(
-            min_interval=min_interval,
-            max_retries=self.retry_times,
-            max_total_wait=max_retry_wait,
-            logger=logger,
-        )
+        self.throttle = throttle
 
         proxy_config = config.get("proxy", {})
         self.proxy_base_url = proxy_config.get("base_url", "http://localhost:8000")
@@ -141,6 +142,15 @@ class ContentAnalyzer:
             )
         except requests.RequestException as e:
             self.logger.warning(f"向号池报告错误失败: {e}")
+
+    @staticmethod
+    def _classify_429_is_daily(exc: Exception) -> bool:
+        """仅在异常明确提示每日配额耗尽时返回 True。"""
+        message = str(exc).lower()
+        if not message:
+            return False
+        daily_markers = ("per day", "daily", "quota exceeded per day")
+        return any(marker in message for marker in daily_markers)
 
     def _delete_remote_file(self, file_name: str) -> None:
         """删除 Gemini Files 存储中的远程文件，释放配额空间。"""
@@ -233,16 +243,51 @@ class ContentAnalyzer:
         """
         upload_path = self._compress_video_for_upload(video_path)
         video_file = None
+        key_id = self._allocated_key_id or "unknown"
 
         try:
+            if not self._client:
+                raise RuntimeError("Gemini Client 未初始化 (缺少 API Key)")
             self.logger.info(f"上传视频文件: {upload_path.name}")
+            self.logger.info(
+                f"API call | op=files.upload | key_id={key_id} | file={upload_path.name}"
+            )
             self.throttle.wait_for_files_op()
             video_file = self._client.files.upload(file=str(upload_path))
+            if video_file is None or not getattr(video_file, "name", None):
+                raise RuntimeError("Gemini 文件上传未返回有效文件名")
+            video_file = cast(Any, video_file)
+            video_file_name = cast(str, video_file.name)
+            self.logger.info(
+                f"API call complete | op=files.upload | key_id={key_id} "
+                + f"| file={upload_path.name} | name={video_file_name}"
+            )
+
+            wait_time = 3
+            max_wait_time = 30
+            max_total_wait = 300
+            start_time = time.monotonic()
 
             while video_file.state.name == "PROCESSING":
-                self.logger.info("等待视频处理...")
+                elapsed = time.monotonic() - start_time
+                remaining = max_total_wait - elapsed
+                if remaining <= 0:
+                    raise TimeoutError("视频处理超时(5分钟)，停止等待")
+
+                sleep_time = min(wait_time, remaining)
+                self.logger.info(f"等待视频处理... (下次检查: {sleep_time:.1f}s)")
+                time.sleep(sleep_time)
                 self.throttle.wait_for_files_op()
-                video_file = self._client.files.get(name=video_file.name)
+                self.logger.debug(
+                    f"API call | op=files.get | key_id={key_id} | file={video_file_name}"
+                )
+                video_file = self._client.files.get(name=video_file_name)
+                video_file = cast(Any, video_file)
+                self.logger.info(
+                    f"API call complete | op=files.get | key_id={key_id} "
+                    + f"| name={video_file_name} | state={video_file.state.name}"
+                )
+                wait_time = min(wait_time * 2, max_wait_time)
 
             if video_file.state.name == "FAILED":
                 raise RuntimeError(f"视频文件处理失败: {video_file.state.name}")
@@ -254,8 +299,234 @@ class ContentAnalyzer:
             self.logger.error(f"视频上传失败: {e}")
             # 如果上传失败，清理远程文件（如果已创建）
             if video_file:
-                self._delete_remote_file(video_file.name)
+                video_file_name = getattr(video_file, "name", None)
+                if video_file_name:
+                    self._delete_remote_file(video_file_name)
             raise
+
+    @staticmethod
+    def _format_timecode(seconds: float) -> str:
+        total_seconds = max(int(seconds), 0)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def _coerce_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value]
+            return [item for item in items if item]
+        if isinstance(value, str) and value.strip():
+            return [item.strip() for item in value.split("\n") if item.strip()]
+        return []
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip().lower()
+
+    @classmethod
+    def _section_signature(cls, section: dict[str, Any]) -> str:
+        topic = cls._normalize_text(str(section.get("topic", "")))
+        explanation = cls._normalize_text(str(section.get("explanation", "")))
+        return f"{topic}|{explanation}"
+
+    @classmethod
+    def _parse_time_value(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            num = float(value)
+            if num > 1000:
+                return num / 1000.0
+            return num
+        if not isinstance(value, str):
+            return None
+
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            num = float(raw)
+            if num > 1000:
+                return num / 1000.0
+            return num
+        if ":" in raw:
+            parts = raw.split(":")
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+            elif len(parts) == 2:
+                hours = "0"
+                minutes, seconds = parts
+            else:
+                return None
+            try:
+                return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _extract_time_range_from_text(
+        cls, text: str
+    ) -> tuple[float | None, float | None]:
+        matches = re.findall(r"\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2}", text)
+        if not matches:
+            return None, None
+        if len(matches) == 1:
+            return cls._parse_time_value(matches[0]), None
+        start = cls._parse_time_value(matches[0])
+        end = cls._parse_time_value(matches[1])
+        return start, end
+
+    @classmethod
+    def _parse_time_range(cls, value: Any) -> tuple[float | None, float | None]:
+        if isinstance(value, dict):
+            start = cls._parse_time_value(
+                value.get("start") or value.get("start_time") or value.get("begin")
+            )
+            end = cls._parse_time_value(
+                value.get("end") or value.get("end_time") or value.get("finish")
+            )
+            return start, end
+        if isinstance(value, str):
+            return cls._extract_time_range_from_text(value)
+        start = cls._parse_time_value(value)
+        return start, None
+
+    @classmethod
+    def _extract_section_time_range(
+        cls,
+        section: dict[str, Any],
+        fallback_range: tuple[float | None, float | None] | None = None,
+    ) -> tuple[float | None, float | None]:
+        for key in ("timestamp", "time_range", "timecode", "time"):
+            if key in section:
+                start, end = cls._parse_time_range(section.get(key))
+                if start is not None or end is not None:
+                    return start, end
+
+        start = cls._parse_time_value(
+            section.get("start_time") or section.get("start") or section.get("begin")
+        )
+        end = cls._parse_time_value(
+            section.get("end_time") or section.get("end") or section.get("finish")
+        )
+        if start is not None or end is not None:
+            return start, end
+
+        if fallback_range is not None:
+            return fallback_range
+        return None, None
+
+    @classmethod
+    def _normalize_chapters(cls, deep_dive: Any) -> list[dict[str, Any]]:
+        if not isinstance(deep_dive, list):
+            return []
+        has_chapter = any(
+            isinstance(item, dict) and ("chapter_title" in item or "sections" in item)
+            for item in deep_dive
+        )
+        if has_chapter:
+            return [item for item in deep_dive if isinstance(item, dict)]
+        sections = [item for item in deep_dive if isinstance(item, dict)]
+        if not sections:
+            return []
+        return [
+            {
+                "chapter_title": "核心要点",
+                "chapter_summary": "",
+                "sections": sections,
+            }
+        ]
+
+    def _build_segment_prompt_parts(
+        self, segment_index: int, total_segments: int, start: float, end: float
+    ) -> list[str]:
+        start_code = self._format_timecode(start)
+        end_code = self._format_timecode(end)
+        segment_context = (
+            f"This is segment {segment_index} of {total_segments}, "
+            f"covering time range {start_code} to {end_code}. "
+            "Output timestamps as absolute video time (HH:MM:SS or milliseconds). "
+            "Structure deep_dive as a single chapter with chapter_title indicating the time range."
+        )
+        return [segment_context]
+
+    @staticmethod
+    def _coerce_float(value: object) -> float | None:
+        if isinstance(value, (int, float, str)):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    def _should_use_segmentation(
+        self, duration: float, plan: SegmentPlan, long_video_config: dict[str, Any]
+    ) -> bool:
+        if duration <= 0:
+            return False
+        if not long_video_config.get("enabled", True):
+            return False
+        threshold = self._coerce_float(
+            long_video_config.get("duration_threshold_seconds")
+        )
+        if threshold is not None and duration >= threshold:
+            return True
+        return plan.num_segments > 1
+
+    def _call_analysis_json(
+        self,
+        video_file: Any,
+        system_role: str,
+        main_prompt: str,
+        extra_text_parts: list[str] | None = None,
+    ) -> dict[str, Any]:
+        reported_retry = False
+
+        def _on_retry(attempt: int, exc: Exception) -> None:
+            nonlocal reported_retry
+            if reported_retry:
+                return
+            reported_retry = True
+            is_daily_limit = self._classify_429_is_daily(exc)
+            self._report_error_to_pool(is_rpd_limit=is_daily_limit)
+
+        json_parse_max_retries = 2
+        response_data = None
+
+        for json_attempt in range(1, json_parse_max_retries + 2):
+            try:
+                reported_retry = False
+                response_data = self.throttle.call_with_retry(
+                    self._generate_content,
+                    video_file,
+                    system_role,
+                    main_prompt,
+                    extra_text_parts,
+                    on_retry_callback=_on_retry,
+                    log_context={
+                        "endpoint": "models.generate_content_stream",
+                        "model": self.model_name,
+                        "key_id": self._allocated_key_id or "unknown",
+                    },
+                )
+                break
+            except ValueError as ve:
+                if json_attempt <= json_parse_max_retries:
+                    self.logger.warning(
+                        f"⚠️ JSON 解析失败 (第 {json_attempt} 次)，重新请求 API: {ve}"
+                    )
+                else:
+                    raise
+
+        self.api_counter.increment("Gemini")
+
+        if response_data is None:
+            raise RuntimeError("Gemini 响应为空")
+
+        return response_data
 
     def analyze_video(self, video_path: str | Path) -> AnalysisResult:
         """
@@ -267,6 +538,17 @@ class ContentAnalyzer:
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
 
         self.logger.info(f"开始分析视频: {video_path.name}")
+
+        duration = probe_duration(video_path)
+        long_video_config = self.analyzer_config.get("long_video", {})
+        segment_plan = plan_segments_with_budget(
+            duration, self.config, self.api_counter.current_count
+        )
+
+        if self._should_use_segmentation(duration, segment_plan, long_video_config):
+            if not self._client:
+                raise RuntimeError("Gemini Client 未初始化 (缺少 API Key)")
+            return self._analyze_video_segments(video_path, duration, segment_plan)
 
         # 检查 API 调用次数 (预留 2 次: 1次内容分析, 1次 Schema 生成)
         if self.api_counter.current_count + 2 > self.api_counter.max_calls:
@@ -286,36 +568,17 @@ class ContentAnalyzer:
             self.logger.info("Step 1: 执行视频内容分析...")
             system_role = self.prompts.get("gemini_analysis", {}).get("system_role", "")
             main_prompt = self.prompts.get("gemini_analysis", {}).get("main_prompt", "")
-
-            def _on_retry(attempt: int, exc: Exception) -> None:
-                """429 重试回调: 向号池报告错误"""
-                self._report_error_to_pool(is_rpd_limit=True)
-
-            # 内层重试: JSON 解析失败时重新请求 API (最多 2 次额外尝试)
-            json_parse_max_retries = 2
-            response_data = None
-            for json_attempt in range(
-                1, json_parse_max_retries + 2
-            ):  # 1 次正常 + 2 次重试
-                try:
-                    response_data = self.throttle.call_with_retry(
-                        self._generate_content,
-                        video_file,
-                        system_role,
-                        main_prompt,
-                        on_retry_callback=_on_retry,
+            try:
+                response_data = self._call_analysis_json(
+                    video_file, system_role, main_prompt
+                )
+            except Exception as exc:
+                if self._is_input_token_overflow_error(exc):
+                    self.logger.warning("检测到输入 token 超限，切换为分段分析模式")
+                    return self._analyze_video_segments(
+                        video_path, duration, segment_plan
                     )
-                    break  # 成功则跳出
-                except ValueError as ve:
-                    if json_attempt <= json_parse_max_retries:
-                        self.logger.warning(
-                            f"⚠️ JSON 解析失败 (第 {json_attempt} 次)，重新请求 API: {ve}"
-                        )
-                    else:
-                        raise  # 最后一次仍失败则抛出
-
-            # 增加 API 计数
-            self.api_counter.increment("Gemini")
+                raise
 
             # Step 2: 生成 Visual Schema
             # 如果 Step 1 已经生成了 Visual Schema，则跳过 Step 2
@@ -381,7 +644,9 @@ class ContentAnalyzer:
         finally:
             # 清理资源
             if video_file:
-                self._delete_remote_file(video_file.name)
+                video_file_name = getattr(video_file, "name", None)
+                if video_file_name:
+                    self._delete_remote_file(video_file_name)
 
             # 清理压缩文件 (可选: 如果希望下次运行复用，可以注释掉这行，或者保留以节省空间)
             # 根据用户需求 "断点处继续"，我们应该保留压缩文件，或者在成功后才清理？
@@ -417,6 +682,349 @@ class ContentAnalyzer:
                 # 或者，仅仅记录日志说"保留压缩文件以便重试"。
                 self.logger.info(f"保留压缩文件以备重试: {compressed_file.name}")
                 pass
+
+    def _analyze_segment_range(
+        self,
+        *,
+        video_path: Path,
+        segment_id: int,
+        segment_index: int,
+        total_segments: int,
+        start: float,
+        end: float,
+        prompt_start: float,
+        prompt_end: float,
+        segment_dir: Path,
+        segment_path: Path | None,
+        min_segment_seconds: float,
+        system_role: str,
+        main_prompt: str,
+    ) -> list[dict[str, Any]]:
+        duration = end - start
+        if duration <= 0:
+            return []
+
+        if not self.api_counter.can_call():
+            raise APILimitExceeded("API 调用次数不足，停止分段分析")
+
+        if segment_path is None:
+            segment_path = segment_dir / (
+                f"segment_{segment_id:04d}_{int(start * 1000):010d}_{int(end * 1000):010d}.mp4"
+            )
+        if not segment_path.exists() or segment_path.stat().st_size <= 0:
+            extracted = extract_segment(
+                input_path=video_path,
+                start=start,
+                end=end,
+                output_path=segment_path,
+                stream_copy=True,
+            )
+            if not extracted:
+                raise RuntimeError("分段视频切割失败")
+
+        video_file = self._upload_video(segment_path)
+        try:
+            self._llm_repair_used = False
+            segment_parts = self._build_segment_prompt_parts(
+                segment_index, total_segments, prompt_start, prompt_end
+            )
+            response_data = self._call_analysis_json(
+                video_file,
+                system_role,
+                main_prompt,
+                extra_text_parts=segment_parts,
+            )
+            return [
+                {
+                    "start": prompt_start,
+                    "end": prompt_end,
+                    "data": response_data,
+                }
+            ]
+        except Exception as exc:
+            if self._is_input_token_overflow_error(exc):
+                if duration / 2 < min_segment_seconds:
+                    raise
+                mid = (start + end) / 2
+                left = self._analyze_segment_range(
+                    video_path=video_path,
+                    segment_id=segment_id,
+                    segment_index=segment_index,
+                    total_segments=total_segments,
+                    start=start,
+                    end=mid,
+                    prompt_start=start,
+                    prompt_end=mid,
+                    segment_dir=segment_dir,
+                    segment_path=None,
+                    min_segment_seconds=min_segment_seconds,
+                    system_role=system_role,
+                    main_prompt=main_prompt,
+                )
+                right = self._analyze_segment_range(
+                    video_path=video_path,
+                    segment_id=segment_id,
+                    segment_index=segment_index,
+                    total_segments=total_segments,
+                    start=mid,
+                    end=end,
+                    prompt_start=mid,
+                    prompt_end=end,
+                    segment_dir=segment_dir,
+                    segment_path=None,
+                    min_segment_seconds=min_segment_seconds,
+                    system_role=system_role,
+                    main_prompt=main_prompt,
+                )
+                return left + right
+            raise
+        finally:
+            if video_file:
+                video_file_name = getattr(video_file, "name", None)
+                if video_file_name:
+                    self._delete_remote_file(video_file_name)
+
+    def _analyze_video_segments(
+        self, video_path: Path, duration: float, plan: SegmentPlan
+    ) -> AnalysisResult:
+        if duration <= 0:
+            raise RuntimeError("无法获取视频时长，无法分段分析")
+
+        long_video_config = self.analyzer_config.get("long_video", {})
+        segment_seconds = plan.segment_duration
+        overlap_seconds = plan.overlap
+        if segment_seconds <= 0:
+            segment_seconds = int(long_video_config.get("min_segment_seconds") or 90)
+            overlap_seconds = 0
+
+        min_segment_seconds = float(long_video_config.get("min_segment_seconds") or 90)
+
+        if plan.hard_max_calls:
+            self.api_counter.set_max_calls(
+                self.api_counter.max_calls, plan.hard_max_calls
+            )
+
+        if not self.api_counter.can_call():
+            raise APILimitExceeded("API 调用次数不足以执行分段分析")
+
+        system_config = self.config.get("system", {})
+        temp_dir = system_config.get("temp_dir", "./data/temp")
+        video_id = video_path.stem
+
+        manifest = load_or_create_manifest(
+            video_id=video_id,
+            duration=duration,
+            segment_seconds=segment_seconds,
+            overlap_seconds=overlap_seconds,
+            temp_dir=temp_dir,
+        )
+        segment_dir = Path(temp_dir) / "segments" / video_id
+        manifest_path = segment_dir / "manifest.json"
+
+        segments = sorted(manifest["segments"], key=lambda item: item["id"])
+        total_segments = len(segments)
+        if total_segments == 0:
+            raise RuntimeError("无法生成分段计划，缺少可分析的片段")
+
+        system_role = self.prompts.get("gemini_analysis", {}).get("system_role", "")
+        main_prompt = self.prompts.get("gemini_analysis", {}).get("main_prompt", "")
+
+        segment_outputs: list[dict[str, Any]] = []
+        gap_notes: list[str] = []
+
+        for entry in segments:
+            segment_id = entry["id"]
+            effective_start = float(entry.get("effective_start", entry["start"]))
+            effective_end = float(entry.get("effective_end", entry["end"]))
+
+            if not self.api_counter.can_call():
+                gap_notes.append(
+                    f"{self._format_timecode(effective_start)}-{self._format_timecode(effective_end)}"
+                )
+                remaining = [item for item in segments if item["id"] > segment_id]
+                for item in remaining:
+                    gap_notes.append(
+                        f"{self._format_timecode(float(item.get('effective_start', item['start'])))}-{self._format_timecode(float(item.get('effective_end', item['end'])))}"
+                    )
+                break
+
+            update_segment_status(
+                manifest, segment_id, "processing", increment_attempts=True
+            )
+            save_manifest(manifest_path, manifest)
+
+            try:
+                segment_results = self._analyze_segment_range(
+                    video_path=video_path,
+                    segment_id=segment_id,
+                    segment_index=segment_id + 1,
+                    total_segments=total_segments,
+                    start=float(entry["start"]),
+                    end=float(entry["end"]),
+                    prompt_start=effective_start,
+                    prompt_end=effective_end,
+                    segment_dir=segment_dir,
+                    segment_path=Path(entry["file_path"]),
+                    min_segment_seconds=min_segment_seconds,
+                    system_role=system_role,
+                    main_prompt=main_prompt,
+                )
+                if segment_results:
+                    segment_outputs.extend(segment_results)
+                    update_segment_status(manifest, segment_id, "completed")
+                else:
+                    update_segment_status(
+                        manifest,
+                        segment_id,
+                        "failed",
+                        error="segment returned empty",
+                    )
+                    gap_notes.append(
+                        f"{self._format_timecode(effective_start)}-{self._format_timecode(effective_end)}"
+                    )
+            except APILimitExceeded:
+                update_segment_status(
+                    manifest,
+                    segment_id,
+                    "skipped",
+                    error="api budget exhausted",
+                )
+                gap_notes.append(
+                    f"{self._format_timecode(effective_start)}-{self._format_timecode(effective_end)}"
+                )
+                remaining = [item for item in segments if item["id"] > segment_id]
+                for item in remaining:
+                    gap_notes.append(
+                        f"{self._format_timecode(float(item.get('effective_start', item['start'])))}-{self._format_timecode(float(item.get('effective_end', item['end'])))}"
+                    )
+                break
+            except Exception as exc:
+                update_segment_status(manifest, segment_id, "failed", error=str(exc))
+                gap_notes.append(
+                    f"{self._format_timecode(effective_start)}-{self._format_timecode(effective_end)}"
+                )
+            finally:
+                save_manifest(manifest_path, manifest)
+
+        if not segment_outputs:
+            raise RuntimeError("分段分析失败，未获得任何有效结果")
+
+        merged = self._merge_segment_outputs(segment_outputs, gap_notes)
+        metadata = {
+            "video_name": video_path.name,
+            "video_size": video_path.stat().st_size,
+            "duration": duration,
+            "segments": total_segments,
+            "segment_gaps": gap_notes,
+        }
+
+        return AnalysisResult.from_api_response(
+            video_path=video_path,
+            response_data=merged,
+            metadata=metadata,
+        )
+
+    def _merge_segment_outputs(
+        self, segment_outputs: list[dict[str, Any]], gap_notes: list[str]
+    ) -> dict[str, Any]:
+        ordered = sorted(segment_outputs, key=lambda item: item.get("start", 0.0))
+        first_data = ordered[0]["data"]
+
+        merged_key_takeaways: list[str] = []
+        seen_takeaways: set[str] = set()
+
+        merged_glossary: dict[str, str] = {}
+        seen_terms: dict[str, str] = {}
+
+        merged_deep_dive: list[dict[str, Any]] = []
+        seen_sections: set[str] = set()
+        last_end_time: float | None = None
+
+        for item in ordered:
+            data = item["data"]
+            key_takeaways = self._coerce_list(data.get("key_takeaways", []))
+            for takeaway in key_takeaways:
+                norm = self._normalize_text(takeaway)
+                if norm in seen_takeaways:
+                    continue
+                merged_key_takeaways.append(takeaway)
+                seen_takeaways.add(norm)
+
+            glossary = data.get("glossary", {})
+            if isinstance(glossary, dict):
+                for term, definition in glossary.items():
+                    term_text = str(term).strip()
+                    if not term_text:
+                        continue
+                    norm = self._normalize_text(term_text)
+                    if norm in seen_terms:
+                        existing_key = seen_terms[norm]
+                        if not merged_glossary.get(existing_key) and definition:
+                            merged_glossary[existing_key] = str(definition)
+                        continue
+                    merged_glossary[term_text] = str(definition)
+                    seen_terms[norm] = term_text
+
+            chapters = self._normalize_chapters(data.get("deep_dive", []))
+            for chapter in chapters:
+                chapter_title = str(chapter.get("chapter_title", ""))
+                chapter_time_range = self._extract_time_range_from_text(chapter_title)
+                sections = chapter.get("sections", [])
+                if not isinstance(sections, list):
+                    continue
+
+                kept_sections: list[dict[str, Any]] = []
+                for section in sections:
+                    if not isinstance(section, dict):
+                        continue
+                    signature = self._section_signature(section)
+                    if signature in seen_sections:
+                        continue
+
+                    start_time, end_time = self._extract_section_time_range(
+                        section, chapter_time_range
+                    )
+                    if (
+                        start_time is not None
+                        and last_end_time is not None
+                        and start_time <= last_end_time
+                    ):
+                        continue
+
+                    kept_sections.append(section)
+                    seen_sections.add(signature)
+                    if end_time is not None:
+                        last_end_time = max(last_end_time or 0.0, end_time)
+                    elif start_time is not None:
+                        last_end_time = max(last_end_time or 0.0, start_time)
+
+                if kept_sections:
+                    merged_deep_dive.append(
+                        {
+                            "chapter_title": chapter.get("chapter_title", ""),
+                            "chapter_summary": chapter.get("chapter_summary", ""),
+                            "sections": kept_sections,
+                        }
+                    )
+
+        if gap_notes:
+            gap_text = "、".join(gap_notes)
+            merged_key_takeaways.append(f"注意：以下片段未覆盖或分析失败：{gap_text}")
+
+        merged: dict[str, Any] = {
+            "title": first_data.get("title", ""),
+            "one_sentence_summary": first_data.get("one_sentence_summary", ""),
+            "key_takeaways": merged_key_takeaways,
+            "deep_dive": merged_deep_dive,
+            "glossary": merged_glossary,
+        }
+
+        if "visual_schemas" in first_data:
+            merged["visual_schemas"] = first_data.get("visual_schemas", [])
+        elif "visual_schema" in first_data:
+            merged["visual_schema"] = first_data.get("visual_schema", "")
+
+        return merged
 
     def _generate_visual_schema(self, deep_dive_content: str) -> str:
         """根据深度解析内容生成 Visual Schema"""
@@ -464,15 +1072,33 @@ class ContentAnalyzer:
             finish_reason_name 为 "STOP"、"MAX_TOKENS" 等字符串，
             如果未获取到 finish_reason 则返回 "UNKNOWN"。
         """
+        if not self._client:
+            raise RuntimeError("Gemini Client 未初始化 (缺少 API Key)")
         response_text_parts: list[str] = []
         thinking_logged = False
         finish_reason_name = "UNKNOWN"
+        key_id = self._allocated_key_id or "unknown"
+        usage_metadata = None
+
+        self.logger.info(
+            f"API call | op=generate_content | key_id={key_id} | model={self.model_name}"
+        )
+        self.logger.info(
+            f"API call | op=models.generate_content_stream | key_id={key_id} "
+            + f"| model={self.model_name}"
+        )
+        contents_any = cast(Any, contents)
 
         for chunk in self._client.models.generate_content_stream(
             model=self.model_name,
-            contents=contents,
+            contents=contents_any,
             config=gen_config,
         ):
+            usage_metadata = (
+                getattr(chunk, "usage_metadata", None)
+                or getattr(chunk, "usage", None)
+                or usage_metadata
+            )
             if not chunk.candidates:
                 continue
 
@@ -499,7 +1125,58 @@ class ContentAnalyzer:
                         self.logger.info(f"  📝 生成中: {snippet}...")
 
         response_text = "".join(response_text_parts)
+        self.logger.info(
+            f"API call complete | op=models.generate_content_stream | key_id={key_id} "
+            + f"| model={self.model_name} | finish_reason={finish_reason_name}"
+        )
+        usage = self._extract_usage_metadata(usage_metadata)
+        if usage:
+            self.logger.info(
+                f"Token usage | prompt={usage.prompt_tokens} output={usage.output_tokens} total={usage.total_tokens}"
+            )
         return response_text, finish_reason_name
+
+    @staticmethod
+    def _extract_usage_metadata(usage: Any) -> SimpleNamespace | None:
+        if usage is None:
+            return None
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+
+        if prompt_tokens is None:
+            prompt_tokens = getattr(usage, "prompt_token_count", None)
+        if output_tokens is None:
+            output_tokens = getattr(usage, "candidates_token_count", None)
+        if total_tokens is None:
+            total_tokens = getattr(usage, "total_token_count", None)
+
+        if prompt_tokens is None or output_tokens is None or total_tokens is None:
+            return None
+
+        return SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+
+    @staticmethod
+    def _is_input_token_overflow_error(exc: Exception) -> bool:
+        """检测是否为输入 token 超限错误（400 INVALID_ARGUMENT）。
+
+        Args:
+            exc: 捕获的异常对象
+
+        Returns:
+            True 如果是输入 token 超过 1048576 的错误
+        """
+        error_msg = str(exc).lower()
+        return (
+            "400" in error_msg
+            and "invalid_argument" in error_msg
+            and "input token count exceeds" in error_msg
+            and "1048576" in error_msg
+        )
 
     def _stream_with_continuation(
         self,
@@ -512,8 +1189,11 @@ class ContentAnalyzer:
         当 finish_reason 为 MAX_TOKENS 时，将已有内容作为 model 回复追加到对话历史，
         再发送续传指令，让 Gemini 从截断处继续输出。最多续传 max_continuations 轮。
 
+        续传策略：第 1 轮使用原始 contents（含 file_data），后续轮次使用纯文本历史
+        （不含 file_data），避免重复发送视频导致输入 token 超限。
+
         Args:
-            contents: 初始对话内容列表（会被原地修改以追加续传轮次）
+            contents: 初始对话内容列表（第 1 轮使用，后续轮次构建新的纯文本历史）
             gen_config: 生成配置
             continuation_prompt: 续传时发送给 Gemini 的用户指令
 
@@ -521,12 +1201,16 @@ class ContentAnalyzer:
             拼接后的完整响应文本
         """
         all_text_parts: list[str] = []
+        text_only_history: list[dict[str, Any]] = []
 
         for round_idx in range(self.max_continuations + 1):
             round_label = f"第 {round_idx + 1} 轮" if round_idx > 0 else "首次请求"
             self.logger.info(f"开始流式接收 Gemini 响应 ({round_label})...")
 
-            response_text, finish_reason = self._stream_response(contents, gen_config)
+            current_contents = contents if round_idx == 0 else text_only_history
+            response_text, finish_reason = self._stream_response(
+                current_contents, gen_config
+            )
 
             self.logger.info(
                 f"流式接收完成 ({round_label})，"
@@ -557,8 +1241,15 @@ class ContentAnalyzer:
                 f"(第 {round_idx + 2}/{self.max_continuations + 1} 轮)..."
             )
 
-            contents.append({"role": "model", "parts": [{"text": response_text}]})
-            contents.append({"role": "user", "parts": [{"text": continuation_prompt}]})
+            if round_idx == 0:
+                text_only_history = self._extract_text_only_prompt(contents)
+
+            text_only_history.append(
+                {"role": "model", "parts": [{"text": response_text}]}
+            )
+            text_only_history.append(
+                {"role": "user", "parts": [{"text": continuation_prompt}]}
+            )
 
             self.throttle.wait_before_call()
 
@@ -568,11 +1259,31 @@ class ContentAnalyzer:
         )
         return total_text
 
+    @staticmethod
+    def _extract_text_only_prompt(
+        contents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """从原始 contents 中提取纯文本部分（移除 file_data）。
+
+        Args:
+            contents: 原始对话内容列表（可能包含 file_data）
+
+        Returns:
+            仅包含文本部分的对话内容列表
+        """
+        text_only: list[dict[str, Any]] = []
+        for msg in contents:
+            text_parts = [part for part in msg.get("parts", []) if "text" in part]
+            if text_parts:
+                text_only.append({"role": msg["role"], "parts": text_parts})
+        return text_only
+
     def _generate_content(
         self,
         video_file: Any,
         system_role: str,
         main_prompt: str,
+        extra_text_parts: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         使用已上传的视频文件生成内容
@@ -586,20 +1297,21 @@ class ContentAnalyzer:
             thinking_config=None,
         )
 
-        contents: list[dict[str, Any]] = [
+        parts: list[dict[str, Any]] = [
             {
-                "role": "user",
-                "parts": [
-                    {
-                        "file_data": {
-                            "file_uri": video_file.uri,
-                            "mime_type": video_file.mime_type,
-                        }
-                    },
-                    {"text": main_prompt},
-                ],
+                "file_data": {
+                    "file_uri": video_file.uri,
+                    "mime_type": video_file.mime_type,
+                }
             }
         ]
+        if extra_text_parts:
+            for text_part in extra_text_parts:
+                if text_part:
+                    parts.append({"text": text_part})
+        parts.append({"text": main_prompt})
+
+        contents: list[dict[str, Any]] = [{"role": "user", "parts": parts}]
 
         continuation_prompt = (
             "你的上一次输出因长度限制被截断了。"
@@ -777,11 +1489,22 @@ class ContentAnalyzer:
             return result.strip()
 
         def _on_retry(attempt: int, exc: Exception) -> None:
-            self._report_error_to_pool(is_rpd_limit=True)
+            nonlocal reported_retry
+            if reported_retry:
+                return
+            reported_retry = True
+            is_daily_limit = self._classify_429_is_daily(exc)
+            self._report_error_to_pool(is_rpd_limit=is_daily_limit)
 
+        reported_retry = False
         return self.throttle.call_with_retry(
             _do_text_call,
             on_retry_callback=_on_retry,
+            log_context={
+                "endpoint": "models.generate_content_stream",
+                "model": self.model_name,
+                "key_id": self._allocated_key_id or "unknown",
+            },
         )
 
     @staticmethod
@@ -808,10 +1531,10 @@ class ContentAnalyzer:
     def _sanitize_json_escapes(text: str) -> str:
         """修复 JSON 字符串值中的非法转义序列。
 
-        常见场景: Gemini 返回的 JSON 中包含 LaTeX 公式 (\frac, \sum, \ln 等),
+        常见场景: Gemini 返回的 JSON 中包含 LaTeX 公式 (\\frac, \\sum, \\ln 等),
         这些在 JSON 规范中是非法的转义序列。
 
-        策略: 仅在字符串值内部, 将 `\X` (X 非 JSON 合法转义字符) 替换为 `\\X`。
+        策略: 仅在字符串值内部, 将 `\\X` (X 非 JSON 合法转义字符) 替换为 `\\\\X`。
         JSON 合法转义字符: " \\ / b f n r t u
         """
         legal_escapes = set('"\\/ b f n r t u'.split() + ['"', "\\", "/"])

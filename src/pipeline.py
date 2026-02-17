@@ -98,6 +98,14 @@ class VideoPipeline:
         self.validation_threshold = validator_config.get("threshold", 75.0)
         self.max_validation_rounds = validator_config.get("max_rounds", 3)
 
+        analyzer_config = self.config.get("analyzer", {})
+        self.gemini_throttle = GeminiThrottle(
+            min_interval=analyzer_config.get("min_call_interval", 4.0),
+            max_retries=analyzer_config.get("retry_times", 10),
+            max_total_wait=analyzer_config.get("max_retry_wait", 600.0),
+            logger=self.logger,
+        )
+
         self.logger.info("VideoPipeline 初始化完成")
 
     def process_single_video(self, url: str) -> ProcessResult:
@@ -135,29 +143,19 @@ class VideoPipeline:
         # 1. 分配当前视频专用 Key
         current_api_key = self._allocate_gemini_key()
 
-        # 2. 创建共享限流器 (同一个视频任务内所有 Gemini 调用共享限速)
-        analyzer_config = self.config.get("analyzer", {})
-        throttle = GeminiThrottle(
-            min_interval=analyzer_config.get("min_call_interval", 4.0),
-            max_retries=analyzer_config.get("retry_times", 10),
-            max_total_wait=analyzer_config.get("max_retry_wait", 600.0),
-            logger=self.logger,
-        )
-
-        # 3. 实例化组件 (使用当前分配的 Key + 共享限流器)
         analyzer = ContentAnalyzer(
             config=self.config,
             api_counter=self.api_counter,
             logger=self.logger,
             api_key=current_api_key,
-            throttle=throttle,
+            throttle=self.gemini_throttle,
         )
         auditor = QualityAuditor(
             config=self.config,
             api_counter=self.api_counter,
             logger=self.logger,
             api_key=current_api_key,
-            throttle=throttle,
+            throttle=self.gemini_throttle,
         )
 
         try:
