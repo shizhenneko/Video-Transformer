@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import re
 import warnings
 
 from .validators import detect_stub_output, validate_markdown_structure
@@ -79,6 +80,9 @@ class KnowledgeDocument:
 
         if self_check_mode == "default":
             return self._to_markdown_default(image_paths)
+
+        if self_check_mode == "lecture":
+            return self._to_markdown_lecture(image_paths)
 
         lines = [
             f"# {self.title}",
@@ -315,6 +319,325 @@ class KnowledgeDocument:
             )
             for term, definition in self.glossary.items():
                 lines.append(f"- **{term}**: {definition}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _to_markdown_lecture(self, image_paths: list[str] | None) -> str:
+        def cleaned(value: Any) -> str:
+            return self._sanitize_lecture_text(value)
+
+        def cleaned_main(value: Any) -> str:
+            sanitized = cleaned(value)
+            return sanitized.replace("```", "").strip()
+
+        def normalize_code_block(value: Any) -> str:
+            sanitized = cleaned(_normalize_field_value(value))
+            if not sanitized:
+                return ""
+            return "\n".join(
+                [line for line in sanitized.splitlines() if line.strip() != "```"]
+            ).strip()
+
+        def split_sentences(text: str) -> list[str]:
+            if not text:
+                return []
+            parts = re.split(r"[。！？!?]", text)
+            return [part.strip() for part in parts if part.strip()]
+
+        def collect_unique_sentences(text: str, seen: set[str]) -> list[str]:
+            sentences: list[str] = []
+            for sentence in split_sentences(text):
+                if sentence in seen:
+                    continue
+                seen.add(sentence)
+                sentences.append(sentence)
+            return sentences
+
+        def collect_topics(sections: list[dict[str, Any]]) -> list[str]:
+            topics: list[str] = []
+            for section in sections:
+                topic = cleaned_main(section.get("topic", ""))
+                if topic:
+                    topics.append(topic)
+            return topics
+
+        lines: list[str] = [f"# {self.title}", ""]
+        chapters = self._normalize_chapters(self.deep_dive)
+
+        lines.extend(["## 核心概念图谱", ""])
+        thesis = cleaned_main(self.one_sentence_summary)
+        if not thesis and self.key_takeaways:
+            thesis = cleaned_main(self.key_takeaways[0])
+        if thesis:
+            lines.append(thesis)
+        else:
+            lines.append("本讲围绕核心概念与实践脉络展开。")
+        lines.append("")
+
+        if chapters:
+            for chapter_num, chapter in enumerate(chapters, 1):
+                chapter_title = cleaned_main(
+                    chapter.get("chapter_title", f"第{chapter_num}章")
+                )
+                if not chapter_title:
+                    chapter_title = f"第{chapter_num}章"
+                lines.append(f"- 第{chapter_num}章：{chapter_title}")
+                section_topics = collect_topics(chapter.get("sections", []))
+                if section_topics:
+                    for topic in section_topics:
+                        lines.append(f"  - {topic}")
+                else:
+                    chapter_summary = cleaned_main(chapter.get("chapter_summary", ""))
+                    if chapter_summary:
+                        lines.append(f"  - {chapter_summary}")
+        else:
+            lines.append("- 本讲围绕关键主题逐步展开")
+        lines.append("")
+
+        lines.extend(["## 主题详解", ""])
+        concept_index: list[str] = []
+        appendix_code_blocks: list[tuple[str, str]] = []
+
+        for chapter_num, chapter in enumerate(chapters, 1):
+            chapter_title = cleaned_main(
+                chapter.get("chapter_title", f"第{chapter_num}章")
+            )
+            if not chapter_title:
+                chapter_title = f"第{chapter_num}章"
+            chapter_summary = cleaned_main(chapter.get("chapter_summary", ""))
+            sections = chapter.get("sections", [])
+
+            lines.append(f"### 第{chapter_num}章：{chapter_title}")
+            lines.append("")
+
+            topics = collect_topics(sections)
+            if chapter_summary:
+                lines.append(chapter_summary)
+            elif topics:
+                lines.append(f"本章围绕 {'、'.join(topics)} 展开。")
+            else:
+                lines.append(f"本章梳理 {chapter_title} 的关键问题与应用场景。")
+            lines.append("")
+
+            if chapter_title:
+                concept_index.append(chapter_title)
+            concept_index.extend(topics)
+
+            stitched_sentences: list[str] = []
+            seen_sentences: set[str] = set()
+            for section in sections:
+                explanation = cleaned_main(
+                    _normalize_field_value(section.get("explanation", ""))
+                )
+                example = cleaned_main(
+                    _normalize_field_value(section.get("example", ""))
+                )
+                stitched_sentences.extend(
+                    collect_unique_sentences(explanation, seen_sentences)
+                )
+                stitched_sentences.extend(
+                    collect_unique_sentences(example, seen_sentences)
+                )
+
+                code = normalize_code_block(section.get("code", ""))
+                if code:
+                    label = cleaned_main(section.get("topic", "")) or chapter_title
+                    appendix_code_blocks.append((label, code))
+
+            if stitched_sentences:
+                lines.append("内容串讲：")
+                lines.append("")
+                for sentence in stitched_sentences[:8]:
+                    lines.append(f"- {sentence}")
+                lines.append("")
+            else:
+                lines.append("内容串讲：")
+                lines.append("")
+                lines.append(f"- 本章聚焦 {chapter_title} 的核心逻辑与落地路径。")
+                lines.append("")
+
+        if not chapters:
+            lines.append("本讲内容以关键概念串联，暂无章节拆分。")
+            lines.append("")
+
+        lines.extend(["## 实战与代码", ""])
+        if appendix_code_blocks:
+            for idx, (label, code) in enumerate(appendix_code_blocks[:2], 1):
+                lines.append(f"### 示例 {idx}：{label}")
+                lines.append("")
+                code_lines = [line for line in code.splitlines() if line.strip()]
+                if not code_lines:
+                    lines.append("本示例仅给出思路，代码略。")
+                    lines.append("")
+                    continue
+
+                lines.append("代码：")
+                lines.append("")
+                for line_num, line in enumerate(code_lines, 1):
+                    lines.append(f"{line_num}. {line}")
+                lines.append("")
+
+                lines.append("逐行说明：")
+                lines.append("")
+                for line_num, line in enumerate(code_lines, 1):
+                    lowered = line.lower()
+                    if "fit" in lowered or "train" in lowered:
+                        explanation = "执行训练或拟合步骤。"
+                    elif "predict" in lowered:
+                        explanation = "输出预测结果供后续评估。"
+                    elif "print" in lowered or "log" in lowered:
+                        explanation = "打印或记录关键结果。"
+                    elif "load" in lowered or "read" in lowered:
+                        explanation = "加载必要的数据或模型。"
+                    else:
+                        explanation = "完成关键计算或调用步骤。"
+                    lines.append(f"{line_num}：{explanation}")
+                lines.append("")
+        else:
+            lines.append("本讲无可复用代码片段")
+            lines.append("")
+
+        lines.extend(["## FAQ / 避坑指南", ""])
+        pitfalls: list[str] = []
+        for chapter in chapters:
+            for section in chapter.get("sections", []):
+                for mistake in self._coerce_list(section.get("common_mistakes", [])):
+                    cleaned_mistake = cleaned_main(mistake)
+                    if cleaned_mistake:
+                        pitfalls.append(cleaned_mistake)
+        deduped_pitfalls: list[str] = []
+        seen_pitfalls = set()
+        for pitfall in pitfalls:
+            if pitfall not in seen_pitfalls:
+                seen_pitfalls.add(pitfall)
+                deduped_pitfalls.append(pitfall)
+        if not deduped_pitfalls:
+            deduped_pitfalls = [
+                "只看训练效果，忽略验证集表现。",
+                "关键假设未检验，导致结论偏差。",
+            ]
+
+        lines.append("常见坑：")
+        lines.append("")
+        for pitfall in deduped_pitfalls[:6]:
+            lines.append(f"- {pitfall}")
+        lines.append("")
+
+        exercises: list[tuple[str, str]] = []
+        for chapter in chapters:
+            raw_questions = chapter.get("chapter_self_check", [])
+            if isinstance(raw_questions, list):
+                for item in raw_questions:
+                    if not isinstance(item, dict):
+                        continue
+                    question = cleaned_main(item.get("q", ""))
+                    answer = cleaned_main(item.get("a", ""))
+                    if question and answer:
+                        exercises.append((question, answer))
+
+        if len(exercises) < 2:
+            topic_pool: list[str] = []
+            for chapter in chapters:
+                topic_pool.extend(collect_topics(chapter.get("sections", [])))
+            for topic in topic_pool[:4]:
+                question = f"为什么 {topic} 在本讲中是关键环节？"
+                answer = f"因为 {topic} 直接影响核心流程的效果与可解释性。"
+                exercises.append((cleaned_main(question), cleaned_main(answer)))
+
+        deduped_exercises: list[tuple[str, str]] = []
+        seen_questions = set()
+        for question, answer in exercises:
+            if question in seen_questions:
+                continue
+            seen_questions.add(question)
+            deduped_exercises.append((question, answer))
+
+        selected_exercises = deduped_exercises[:4]
+        if len(selected_exercises) < 2:
+            fallback_question = "结合本讲内容，说明一个关键概念的应用场景。"
+            fallback_answer = "可用于解决与核心概念相关的实际建模或决策问题。"
+            selected_exercises.append((fallback_question, fallback_answer))
+        selected_exercises = selected_exercises[:4]
+
+        lines.append("练习与答解：")
+        lines.append("")
+        for idx, (question, _) in enumerate(selected_exercises, 1):
+            lines.append(f"{idx}. {question}")
+        for _, (_, answer) in enumerate(selected_exercises, 1):
+            lines.append(f"答：{answer}")
+        lines.append("")
+
+        lines.extend(["## 📎 附录 (Appendix)", ""])
+        lines.append("### 图解（知识蓝图）")
+        lines.append("")
+        if image_paths:
+            for idx, img_path in enumerate(image_paths):
+                desc = ""
+                if idx < len(self.visual_schemas):
+                    desc = cleaned(self.visual_schemas[idx].description)
+                label = desc if desc else f"知识蓝图 {idx + 1}"
+                lines.append(f"**{label}**")
+                lines.append("")
+                lines.append(f"![{label}]({img_path})")
+                lines.append("")
+        elif self.visual_schemas:
+            for schema in self.visual_schemas:
+                description = cleaned(schema.description)
+                if description:
+                    lines.append(f"- {description}")
+                schema_text = cleaned(schema.schema)
+                if schema_text:
+                    lines.append("```")
+                    lines.append(schema_text)
+                    lines.append("```")
+                    lines.append("")
+        else:
+            lines.append("- 暂无图解内容")
+            lines.append("")
+
+        lines.append("### 术语表（Glossary）")
+        lines.append("")
+        if self.glossary:
+            for term, definition in self.glossary.items():
+                cleaned_term = cleaned(term)
+                cleaned_def = cleaned(definition)
+                if cleaned_term and cleaned_def:
+                    lines.append(f"- **{cleaned_term}**：{cleaned_def}")
+        else:
+            lines.append("- 暂无术语补充")
+        lines.append("")
+
+        lines.append("### 概念索引（Concept Index）")
+        lines.append("")
+        index_items: list[str] = []
+        if self.key_takeaways:
+            index_items.extend([cleaned(takeaway) for takeaway in self.key_takeaways])
+        index_items.extend(concept_index)
+        if self.glossary:
+            index_items.extend([cleaned(key) for key in self.glossary])
+        seen = set()
+        for item in index_items:
+            if item and item not in seen:
+                seen.add(item)
+                lines.append(f"- {item}")
+        if not seen:
+            lines.append("- 暂无概念索引")
+        lines.append("")
+
+        lines.append("### 代码与伪代码")
+        lines.append("")
+        if appendix_code_blocks:
+            for label, code in appendix_code_blocks:
+                if label:
+                    lines.append(f"**{label}**")
+                    lines.append("")
+                lines.append("```python")
+                lines.append(code)
+                lines.append("```")
+                lines.append("")
+        else:
+            lines.append("- 本讲无可复用代码片段")
             lines.append("")
 
         return "\n".join(lines)
@@ -639,9 +962,266 @@ class KnowledgeDocument:
     @staticmethod
     def _normalize_self_check_mode(mode: str) -> str:
         normalized = (mode or "").strip().lower()
-        if normalized in {"static", "interactive", "questions_only", "default"}:
+        if normalized in {
+            "static",
+            "interactive",
+            "questions_only",
+            "default",
+            "lecture",
+        }:
             return normalized
         return "static"
+
+    @staticmethod
+    def _normalize_chapters(deep_dive: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if any("chapter_title" in item for item in deep_dive):
+            return deep_dive
+        return [
+            {
+                "chapter_title": "核心要点",
+                "chapter_summary": "",
+                "sections": deep_dive,
+            }
+        ]
+
+    @staticmethod
+    def _sanitize_lecture_text(text: Any) -> str:
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+
+        patterns = [
+            r"\$[^$]+\$",
+            r"\\\([^)]+\\\)",
+            r"\\\[[^\]]+\\\]",
+            r"<details>",
+            r"</details>",
+            r"<summary>",
+            r"</summary>",
+            r"\b\d{1,2}:\d{2}\b",
+            r"\(\d{1,2}:\d{2}[–—-]\d{1,2}:\d{2}\)",
+        ]
+
+        cleaned_lines: list[str] = []
+        for line in text.splitlines():
+            cleaned = line
+            for pattern in patterns:
+                cleaned = re.sub(pattern, "", cleaned)
+            cleaned = " ".join(cleaned.split())
+            if cleaned:
+                cleaned_lines.append(cleaned)
+
+        return "\n".join(cleaned_lines).strip()
+
+    @staticmethod
+    def _render_chapter_exercises(
+        chapter: dict[str, Any],
+        chapter_title: str,
+        topics: list[str],
+    ) -> tuple[list[str], list[str]]:
+        raw_questions = chapter.get("chapter_self_check", [])
+        questions: list[str] = []
+        answers: list[str] = []
+
+        if isinstance(raw_questions, list):
+            for item in raw_questions:
+                if isinstance(item, dict) and "q" in item and "a" in item:
+                    q = KnowledgeDocument._sanitize_lecture_text(item.get("q", ""))
+                    a = KnowledgeDocument._sanitize_lecture_text(item.get("a", ""))
+                    if q and a:
+                        questions.append(q)
+                        answers.append(a)
+
+        fallback_pairs = KnowledgeDocument._generate_fallback_exercises(
+            chapter_title, topics
+        )
+        while len(questions) < 3 and fallback_pairs:
+            q, a = fallback_pairs.pop(0)
+            questions.append(q)
+            answers.append(a)
+
+        if not questions:
+            questions.append(f"用一句话概括 {chapter_title} 的核心主题。")
+            answers.append(f"核心主题是：{chapter_title}。")
+
+        question_lines = [f"{idx}. {q}" for idx, q in enumerate(questions, 1)]
+        answer_lines = [f"{idx}. {a}" for idx, a in enumerate(answers, 1)]
+
+        return question_lines, answer_lines
+
+    @staticmethod
+    def _generate_fallback_exercises(
+        chapter_title: str,
+        topics: list[str],
+    ) -> list[tuple[str, str]]:
+        topic_hint = "、".join(topics[:2]) if topics else chapter_title
+        return [
+            (
+                "用一句话概括本章核心主题。",
+                f"本章核心主题是：{chapter_title}。",
+            ),
+            (
+                "列出本章涉及的两个关键概念。",
+                f"关键概念包括：{topic_hint}。",
+            ),
+            (
+                "给出一个本章的应用场景。",
+                f"可用于与 {topic_hint} 相关的实际建模与评估任务。",
+            ),
+            (
+                "说明一个常见误区并给出改进方向。",
+                "常见误区是只看训练集指标，改进方向是加入验证集监控。",
+            ),
+        ]
+
+
+def _format_bulleted_item(text: str) -> list[str]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+    formatted = [f"- {lines[0]}"]
+    for line in lines[1:]:
+        formatted.append(f"  {line}")
+    return formatted
+
+
+def _format_ordered_list(items: list[str]) -> list[str]:
+    lines: list[str] = []
+    for index, item in enumerate(items, 1):
+        item_lines = [line for line in item.splitlines() if line.strip()]
+        if not item_lines:
+            continue
+        lines.append(f"{index}. {item_lines[0]}")
+        for line in item_lines[1:]:
+            lines.append(f"   {line}")
+    return lines
+
+
+def _normalize_steps_value(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        steps: list[str] = []
+        for item in value:
+            normalized = _normalize_field_value(item)
+            if normalized:
+                steps.append(normalized)
+        return steps
+    if isinstance(value, str):
+        return [line.strip() for line in value.splitlines() if line.strip()]
+    normalized = _normalize_field_value(value)
+    return [normalized] if normalized else []
+
+
+def _normalize_field_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        if not value:
+            return ""
+        io_keys = {"input", "steps", "output"}
+        has_io_keys = any(key in value for key in io_keys)
+        if has_io_keys:
+            parts: list[str] = []
+            input_value = _normalize_field_value(value.get("input"))
+            if input_value:
+                parts.append(f"输入：{input_value}")
+            steps_value = _normalize_steps_value(value.get("steps"))
+            if steps_value:
+                parts.append("步骤：")
+                parts.extend(_format_ordered_list(steps_value))
+            output_value = _normalize_field_value(value.get("output"))
+            if output_value:
+                parts.append(f"输出：{output_value}")
+
+            extra_keys = sorted(key for key in value.keys() if key not in io_keys)
+            if extra_keys:
+                parts.append("其他：")
+                for key in extra_keys:
+                    normalized = _normalize_field_value(value.get(key))
+                    label = f"{key}: {normalized}" if normalized else f"{key}:"
+                    parts.extend(_format_bulleted_item(label))
+            return "\n".join(parts).strip()
+
+        lines: list[str] = []
+        for key in sorted(value.keys()):
+            normalized = _normalize_field_value(value.get(key))
+            label = f"{key}: {normalized}" if normalized else f"{key}:"
+            lines.extend(_format_bulleted_item(label))
+        return "\n".join(lines).strip()
+
+    if isinstance(value, list):
+        lines: list[str] = []
+        for item in value:
+            normalized = _normalize_field_value(item)
+            if not normalized:
+                continue
+            item_lines = [line for line in normalized.splitlines() if line.strip()]
+            if not item_lines:
+                continue
+            if all(line.startswith("- ") for line in item_lines):
+                lines.extend(item_lines)
+            else:
+                lines.extend(_format_bulleted_item("\n".join(item_lines)))
+        return "\n".join(lines).strip()
+
+    return str(value).strip()
+
+
+def _normalize_list_field(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items: list[str] = []
+        for item in value:
+            normalized = _normalize_field_value(item)
+            if not normalized:
+                continue
+            lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+            if lines and all(line.startswith("- ") for line in lines):
+                items.extend([line[2:].strip() for line in lines])
+            else:
+                items.append("\n".join(lines))
+        return items
+    if isinstance(value, str):
+        return [line.strip() for line in value.splitlines() if line.strip()]
+    normalized = _normalize_field_value(value)
+    return [normalized] if normalized else []
+
+
+def _normalize_section_fields(section: dict[str, object]) -> dict[str, object]:
+    normalized = dict(section)
+    normalized["explanation"] = _normalize_field_value(section.get("explanation"))
+    normalized["example"] = _normalize_field_value(section.get("example"))
+    normalized["code"] = _normalize_field_value(section.get("code"))
+    normalized["common_mistakes"] = _normalize_list_field(
+        section.get("common_mistakes")
+    )
+    normalized["connections"] = _normalize_list_field(section.get("connections"))
+    return normalized
+
+
+def _normalize_deep_dive(deep_dive: object) -> list[dict[str, object]]:
+    if not isinstance(deep_dive, list):
+        return []
+    normalized: list[dict[str, object]] = []
+    for item in deep_dive:
+        if not isinstance(item, dict):
+            continue
+        if "sections" in item and isinstance(item.get("sections"), list):
+            chapter = dict(item)
+            chapter_sections: list[dict[str, object]] = []
+            for section in item.get("sections", []):
+                if isinstance(section, dict):
+                    chapter_sections.append(_normalize_section_fields(section))
+            chapter["sections"] = chapter_sections
+            normalized.append(chapter)
+        else:
+            normalized.append(_normalize_section_fields(item))
+    return normalized
 
 
 @dataclass
@@ -787,7 +1367,7 @@ class AnalysisResult:
             title=response_data["title"],
             one_sentence_summary=response_data["one_sentence_summary"],
             key_takeaways=response_data["key_takeaways"],
-            deep_dive=response_data["deep_dive"],
+            deep_dive=_normalize_deep_dive(response_data["deep_dive"]),
             glossary=response_data.get("glossary", optional_defaults["glossary"]),
             visual_schemas=visual_schemas,
         )

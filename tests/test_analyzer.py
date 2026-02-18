@@ -2,9 +2,9 @@
 视频内容分析模块单元测试
 """
 
-import json
-from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+import logging
+from typing import cast
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,6 +12,9 @@ from analyzer.content_analyzer import ContentAnalyzer
 from analyzer.models import KnowledgeDocument, AnalysisResult
 from analyzer.prompt_loader import load_prompts, render_prompt
 from utils.counter import APICounter
+from utils.gemini_throttle import GeminiThrottle
+
+ConfigDict = dict[str, dict[str, object]]
 
 
 class TestPromptLoader:
@@ -128,7 +131,7 @@ class TestAnalysisResult:
         }
 
         with pytest.raises(ValueError, match="API 响应缺少必需字段"):
-            AnalysisResult.from_api_response(
+            _ = AnalysisResult.from_api_response(
                 video_path="test.mp4",
                 response_data=response_data,
             )
@@ -157,7 +160,7 @@ class TestContentAnalyzer:
     """测试内容分析器"""
 
     @pytest.fixture
-    def mock_config(self):
+    def mock_config(self) -> ConfigDict:
         return {
             "proxy": {
                 "base_url": "http://localhost:8000",
@@ -173,96 +176,144 @@ class TestContentAnalyzer:
         }
 
     @pytest.fixture
-    def mock_api_counter(self):
+    def mock_api_counter(self) -> APICounter:
         return APICounter(max_calls=10, current_count=0)
 
     @pytest.fixture
-    def mock_logger(self):
-        return MagicMock()
+    def mock_logger(self) -> logging.Logger:
+        return MagicMock(spec=logging.Logger)
 
-    def test_init_with_fixed_api_key(self, mock_config, mock_api_counter, mock_logger):
+    @pytest.fixture
+    def mock_throttle(self, mock_logger: logging.Logger) -> GeminiThrottle:
+        return GeminiThrottle(
+            min_interval=0.0,
+            max_retries=1,
+            max_total_wait=1.0,
+            logger=mock_logger,
+        )
+
+    def test_init_with_fixed_api_key(
+        self,
+        mock_config: ConfigDict,
+        mock_api_counter: APICounter,
+        mock_logger: logging.Logger,
+        mock_throttle: GeminiThrottle,
+    ) -> None:
         with patch("analyzer.content_analyzer.genai.Client") as mock_client_class:
             analyzer = ContentAnalyzer(
                 config=mock_config,
                 api_counter=mock_api_counter,
                 logger=mock_logger,
+                throttle=mock_throttle,
                 api_key="test_api_key",
             )
 
             mock_client_class.assert_called_once_with(
                 api_key="test_api_key", http_options={"timeout": 600000}
             )
-            assert analyzer._fixed_api_key == "test_api_key"
-            assert analyzer._client is not None
-            assert analyzer.model_name == "gemini-2.5-flash"
-            assert analyzer.temperature == 0.7
-            assert analyzer.max_output_tokens == 8192
-            assert analyzer.retry_times == 3
-            assert analyzer.timeout == 120
+            assert analyzer._fixed_api_key == "test_api_key"  # pyright: ignore[reportPrivateUsage]
+            assert analyzer._client is not None  # pyright: ignore[reportPrivateUsage]
+            analyzer_config = cast(dict[str, object], analyzer.analyzer_config)
+            assert cast(str, analyzer.model_name) == "gemini-2.5-flash"
+            assert cast(float, analyzer.temperature) == 0.7
+            assert cast(int, analyzer.max_output_tokens) == 8192
+            assert analyzer_config.get("retry_times") == 3
+            assert cast(int, analyzer.timeout) == 120
 
     def test_init_proxy_mode_no_configure(
-        self, mock_config, mock_api_counter, mock_logger
-    ):
+        self,
+        mock_config: ConfigDict,
+        mock_api_counter: APICounter,
+        mock_logger: logging.Logger,
+        mock_throttle: GeminiThrottle,
+    ) -> None:
         # 不需要 mock,因为没有固定 key 时不会创建 client
         analyzer = ContentAnalyzer(
             config=mock_config,
             api_counter=mock_api_counter,
             logger=mock_logger,
+            throttle=mock_throttle,
             api_key=None,
         )
 
-        assert analyzer._fixed_api_key is None
-        assert analyzer._client is None
-        assert analyzer.proxy_base_url == "http://localhost:8000"
+        assert analyzer._fixed_api_key is None  # pyright: ignore[reportPrivateUsage]
+        assert analyzer._client is None  # pyright: ignore[reportPrivateUsage]
+        assert cast(str, analyzer.proxy_base_url) == "http://localhost:8000"
 
     # _allocate_key_from_pool tests removed as method is deleted
 
-    def test_report_usage_to_pool(self, mock_config, mock_api_counter, mock_logger):
+    def test_report_usage_to_pool(
+        self,
+        mock_config: ConfigDict,
+        mock_api_counter: APICounter,
+        mock_logger: logging.Logger,
+        mock_throttle: GeminiThrottle,
+    ) -> None:
         analyzer = ContentAnalyzer(
             config=mock_config,
             api_counter=mock_api_counter,
             logger=mock_logger,
+            throttle=mock_throttle,
         )
-        analyzer._allocated_key_id = "key_1"
+        analyzer._allocated_key_id = "key_1"  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
         with patch("analyzer.content_analyzer.requests.post") as mock_post:
-            analyzer._report_usage_to_pool()
+            analyzer._report_usage_to_pool()  # pyright: ignore[reportPrivateUsage]
             mock_post.assert_called_once()
             call_kwargs = mock_post.call_args
             assert call_kwargs[1]["json"] == {"key_id": "key_1"}
 
     def test_report_usage_skipped_without_allocation(
-        self, mock_config, mock_api_counter, mock_logger
-    ):
+        self,
+        mock_config: ConfigDict,
+        mock_api_counter: APICounter,
+        mock_logger: logging.Logger,
+        mock_throttle: GeminiThrottle,
+    ) -> None:
         analyzer = ContentAnalyzer(
             config=mock_config,
             api_counter=mock_api_counter,
             logger=mock_logger,
+            throttle=mock_throttle,
         )
 
         with patch("analyzer.content_analyzer.requests.post") as mock_post:
-            analyzer._report_usage_to_pool()
+            analyzer._report_usage_to_pool()  # pyright: ignore[reportPrivateUsage]
             mock_post.assert_not_called()
 
-    def test_report_error_to_pool(self, mock_config, mock_api_counter, mock_logger):
+    def test_report_error_to_pool(
+        self,
+        mock_config: ConfigDict,
+        mock_api_counter: APICounter,
+        mock_logger: logging.Logger,
+        mock_throttle: GeminiThrottle,
+    ) -> None:
         analyzer = ContentAnalyzer(
             config=mock_config,
             api_counter=mock_api_counter,
             logger=mock_logger,
+            throttle=mock_throttle,
         )
-        analyzer._allocated_key_id = "key_2"
+        analyzer._allocated_key_id = "key_2"  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
         with patch("analyzer.content_analyzer.requests.post") as mock_post:
-            analyzer._report_error_to_pool(is_rpd_limit=True)
+            analyzer._report_error_to_pool(is_rpd_limit=True)  # pyright: ignore[reportPrivateUsage]
             mock_post.assert_called_once()
             call_kwargs = mock_post.call_args
             assert call_kwargs[1]["json"] == {"key_id": "key_2", "is_rpd_limit": True}
 
-    def test_generate_report(self, mock_config, mock_api_counter, mock_logger):
+    def test_generate_report(
+        self,
+        mock_config: ConfigDict,
+        mock_api_counter: APICounter,
+        mock_logger: logging.Logger,
+        mock_throttle: GeminiThrottle,
+    ) -> None:
         analyzer = ContentAnalyzer(
             config=mock_config,
             api_counter=mock_api_counter,
             logger=mock_logger,
+            throttle=mock_throttle,
         )
 
         doc = KnowledgeDocument(

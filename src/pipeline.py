@@ -31,6 +31,7 @@ from utils.counter import (  # type: ignore[reportImplicitRelativeImport]
 from utils.gemini_throttle import (  # type: ignore[reportImplicitRelativeImport]
     GeminiThrottle,
 )
+from utils.note_refiner import refine_note  # type: ignore[reportImplicitRelativeImport]
 from utils.progress_tracker import (  # type: ignore[reportImplicitRelativeImport]
     ProgressTracker,
 )
@@ -284,6 +285,7 @@ class VideoPipeline:
                 video_id=video_id,
                 document_content=document_content,
                 image_data=image_data,
+                duration=analysis_result.metadata.get("duration"),
             )
 
             # 计算 API 调用次数
@@ -447,7 +449,11 @@ class VideoPipeline:
         return current_structure
 
     def _save_outputs(
-        self, video_id: str, document_content: str, image_data: bytes | None
+        self,
+        video_id: str,
+        document_content: str,
+        image_data: bytes | None,
+        duration: float | None = None,
     ) -> tuple[Path, Path | None]:
         """
         保存输出文件
@@ -456,10 +462,21 @@ class VideoPipeline:
             video_id: 视频 ID
             document_content: 文档内容
             image_data: 图片数据 (可选)
+            duration: 视频时长(秒) (可选)
 
         Returns:
             (文档路径, 图片路径)
         """
+        # 如果启用了 note_refine，在保存前优化文档长度
+        refine_config = self.config.get("system", {}).get("note_refine", {})
+        refine_enabled = bool(refine_config.get("enabled", False))
+        if refine_enabled and duration is not None:
+            document_content = refine_note(
+                document_content,
+                duration_seconds=duration,
+                config=refine_config,
+            )
+
         # 文档路径: {video_id}_knowledge_note.md
         doc_path = self.doc_dir / f"{video_id}_knowledge_note.md"
         with open(doc_path, "w", encoding="utf-8") as f:
@@ -477,11 +494,17 @@ class VideoPipeline:
 
     @staticmethod
     def _resolve_self_check_mode(config: dict[str, Any]) -> str:
-        mode = str(config.get("system", {}).get("self_check_mode", "static"))
+        mode = str(config.get("system", {}).get("self_check_mode", "lecture"))
         normalized = mode.strip().lower()
-        if normalized in {"static", "interactive", "questions_only", "default"}:
+        if normalized in {
+            "static",
+            "interactive",
+            "questions_only",
+            "default",
+            "lecture",
+        }:
             return normalized
-        return "static"
+        return "lecture"
 
     def _extract_video_id(self, url: str) -> str:
         """

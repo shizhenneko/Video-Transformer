@@ -6,17 +6,21 @@
 2. 测试视频文件
 """
 
+import logging
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
-import requests
 
 from analyzer import AnalysisResult, ContentAnalyzer
 from utils.config import load_config
 from utils.counter import APICounter
+from utils.gemini_throttle import GeminiThrottle
 from utils.logger import setup_logging
 from utils.proxy import verify_proxy_connection, verify_sdk_endpoint
+
+ConfigDict = dict[str, object]
 
 
 PROXY_BASE_URL = "http://localhost:8000"
@@ -45,24 +49,62 @@ class TestContentAnalyzerIntegration:
     """内容分析器集成测试（通过号池分配 Key）"""
 
     @pytest.fixture
-    def config(self):
+    def config(self) -> ConfigDict:
         return load_config()
 
     @pytest.fixture
-    def api_counter(self):
+    def api_counter(self) -> APICounter:
         return APICounter(max_calls=10, current_count=0)
 
     @pytest.fixture
-    def logger(self, tmp_path):
+    def logger(self, tmp_path: Path) -> logging.Logger:
         return setup_logging(log_dir=tmp_path, log_name="test_analyzer.log")
 
     @pytest.fixture
-    def analyzer(self, config, api_counter, logger):
+    def throttle(self, config: ConfigDict, logger: logging.Logger) -> GeminiThrottle:
+        analyzer_config = cast(dict[str, object], config.get("analyzer", {}))
+        min_interval_raw = analyzer_config.get("min_call_interval", 4.0)
+        max_retries_raw = analyzer_config.get("retry_times", 10)
+        max_total_wait_raw = analyzer_config.get("max_retry_wait", 600.0)
+        min_interval = (
+            float(min_interval_raw)
+            if isinstance(min_interval_raw, (int, float, str))
+            else 4.0
+        )
+        max_retries = (
+            int(max_retries_raw)
+            if isinstance(max_retries_raw, (int, float, str))
+            else 10
+        )
+        max_total_wait = (
+            float(max_total_wait_raw)
+            if isinstance(max_total_wait_raw, (int, float, str))
+            else 600.0
+        )
+        return GeminiThrottle(
+            min_interval=min_interval,
+            max_retries=max_retries,
+            max_total_wait=max_total_wait,
+            logger=logger,
+        )
+
+    @pytest.fixture
+    def analyzer(
+        self,
+        config: ConfigDict,
+        api_counter: APICounter,
+        logger: logging.Logger,
+        throttle: GeminiThrottle,
+    ) -> ContentAnalyzer:
+        api_key = os.getenv("VT_GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            pytest.skip("未设置 Gemini API Key")
         return ContentAnalyzer(
             config=config,
             api_counter=api_counter,
             logger=logger,
-            api_key=None,
+            throttle=throttle,
+            api_key=api_key,
         )
 
     @pytest.fixture
@@ -79,7 +121,12 @@ class TestContentAnalyzerIntegration:
 
     @skip_if_no_proxy
     @skip_if_no_sdk_endpoint
-    def test_video_analysis_end_to_end(self, analyzer, test_video_path, api_counter):
+    def test_video_analysis_end_to_end(
+        self,
+        analyzer: ContentAnalyzer,
+        test_video_path: Path,
+        api_counter: APICounter,
+    ) -> None:
         initial_count = api_counter.current_count
 
         result = analyzer.analyze_video(test_video_path)
@@ -95,7 +142,9 @@ class TestContentAnalyzerIntegration:
 
     @skip_if_no_proxy
     @skip_if_no_sdk_endpoint
-    def test_document_quality(self, analyzer, test_video_path):
+    def test_document_quality(
+        self, analyzer: ContentAnalyzer, test_video_path: Path
+    ) -> None:
         result = analyzer.analyze_video(test_video_path)
 
         assert result.knowledge_doc.title, "标题不能为空"
@@ -121,7 +170,9 @@ class TestContentAnalyzerIntegration:
 
     @skip_if_no_proxy
     @skip_if_no_sdk_endpoint
-    def test_markdown_generation(self, analyzer, test_video_path):
+    def test_markdown_generation(
+        self, analyzer: ContentAnalyzer, test_video_path: Path
+    ) -> None:
         result = analyzer.analyze_video(test_video_path)
         markdown = analyzer.generate_report(result)
 
@@ -137,10 +188,15 @@ class TestContentAnalyzerIntegration:
 
     @skip_if_no_proxy
     @skip_if_no_sdk_endpoint
-    def test_api_counter_integration(self, analyzer, test_video_path, api_counter):
+    def test_api_counter_integration(
+        self,
+        analyzer: ContentAnalyzer,
+        test_video_path: Path,
+        api_counter: APICounter,
+    ) -> None:
         initial_count = api_counter.current_count
 
-        analyzer.analyze_video(test_video_path)
+        _ = analyzer.analyze_video(test_video_path)
 
         assert api_counter.current_count == initial_count + 1
         assert api_counter.can_call(), "应该还能继续调用 API"
@@ -149,16 +205,40 @@ class TestContentAnalyzerIntegration:
 
 @skip_if_no_proxy
 @skip_if_no_sdk_endpoint
-def test_generate_example_documents(tmp_path):
+def test_generate_example_documents(tmp_path: Path) -> None:
     config = load_config()
     api_counter = APICounter(max_calls=10, current_count=0)
     logger = setup_logging(log_dir=tmp_path, log_name="example_generation.log")
+    analyzer_config = cast(dict[str, object], config.get("analyzer", {}))
+    min_interval_raw = analyzer_config.get("min_call_interval", 4.0)
+    max_retries_raw = analyzer_config.get("retry_times", 10)
+    max_total_wait_raw = analyzer_config.get("max_retry_wait", 600.0)
+    min_interval = (
+        float(min_interval_raw)
+        if isinstance(min_interval_raw, (int, float, str))
+        else 4.0
+    )
+    max_retries = (
+        int(max_retries_raw) if isinstance(max_retries_raw, (int, float, str)) else 10
+    )
+    max_total_wait = (
+        float(max_total_wait_raw)
+        if isinstance(max_total_wait_raw, (int, float, str))
+        else 600.0
+    )
+    throttle = GeminiThrottle(
+        min_interval=min_interval,
+        max_retries=max_retries,
+        max_total_wait=max_total_wait,
+        logger=logger,
+    )
 
     api_key = os.getenv("GEMINI_API_KEY")
     analyzer = ContentAnalyzer(
         config=config,
         api_counter=api_counter,
         logger=logger,
+        throttle=throttle,
         api_key=api_key,
     )
 
@@ -173,7 +253,7 @@ def test_generate_example_documents(tmp_path):
     if not video_files:
         pytest.skip("未找到测试视频文件")
 
-    output_dir = project_root / "data" / "output" / "documents"
+    output_dir = tmp_path / "documents"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, video_path in enumerate(video_files, 1):
@@ -184,7 +264,7 @@ def test_generate_example_documents(tmp_path):
             markdown = analyzer.generate_report(result)
 
             output_file = output_dir / f"doc_example_{idx}.md"
-            output_file.write_text(markdown, encoding="utf-8")
+            _ = output_file.write_text(markdown, encoding="utf-8")
 
             logger.info(f"示例文档已保存: {output_file}")
 

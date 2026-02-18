@@ -5,8 +5,8 @@ system:
   log_dir: "./data/output/logs"
   
   # Legacy self-check mode (preserved for backward compatibility)
-  # Options: "static" (legacy v2 format) | "default" (Core+Appendix format)
-  self_check_mode: "static"
+  # Options: "lecture" (default, PDF-friendly) | "static" (legacy v2 format) | "default" (Core+Appendix format)
+  self_check_mode: "lecture"
   
   # Note rendering style configuration (Core+Appendix vs Full Detail)
   # Options: "core_appendix" (default) | "full_detail" (legacy)
@@ -31,6 +31,15 @@ system:
   # - appendix_only: Code blocks moved to appendix section
   # - inline: Code blocks remain in main content (legacy v2 behavior)
   code_placement: "appendix_only"
+  
+  # Note refiner configuration (automatic length optimization)
+  note_refine:
+    enabled: true
+    lines_per_hour: 400
+    min_lines: 220
+    max_lines: 900
+    tolerance_ratio: 0.10
+    exclude_code_from_budget: false
 
 proxy:
   base_url: "http://localhost:8000"
@@ -46,7 +55,7 @@ downloader:
   max_sleep_interval: 4  # 最大请求间隔(秒)
 
 analyzer:
-  model: "gemini-2.5-flash"  # Gemini 模型名称
+  model: "gemini-2.5-flash-lite"  # Gemini 模型名称
   temperature: 0.7               # 生成温度
   # Reduced from 150000 to avoid TPM (tokens-per-minute) throttling
   max_output_tokens: 65536        # 最大输出 token 数
