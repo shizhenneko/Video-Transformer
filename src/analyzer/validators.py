@@ -61,6 +61,7 @@ class KnowledgeDocumentLike(Protocol):
         self,
         image_paths: list[str] | None = None,
         self_check_mode: str = "static",
+        include_concept_index: bool | None = None,
     ) -> str: ...
 
 

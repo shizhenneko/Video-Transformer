@@ -65,6 +65,7 @@ class KnowledgeDocument:
         self,
         image_paths: list[str] | None = None,
         self_check_mode: str = "static",
+        include_concept_index: bool | None = None,
     ) -> str:
         """
         将知识笔记转换为 Markdown 格式
@@ -82,7 +83,9 @@ class KnowledgeDocument:
             return self._to_markdown_default(image_paths)
 
         if self_check_mode == "lecture":
-            return self._to_markdown_lecture(image_paths)
+            return self._to_markdown_lecture(
+                image_paths, include_concept_index=include_concept_index
+            )
 
         lines = [
             f"# {self.title}",
@@ -323,7 +326,14 @@ class KnowledgeDocument:
 
         return "\n".join(lines)
 
-    def _to_markdown_lecture(self, image_paths: list[str] | None) -> str:
+    def _to_markdown_lecture(
+        self,
+        image_paths: list[str] | None,
+        include_concept_index: bool | None = None,
+    ) -> str:
+        if include_concept_index is None:
+            include_concept_index = True
+
         def cleaned(value: Any) -> str:
             return self._sanitize_lecture_text(value)
 
@@ -361,6 +371,22 @@ class KnowledgeDocument:
                 if topic:
                     topics.append(topic)
             return topics
+
+        def is_gap_note_or_timecode(value: str) -> bool:
+            if not value:
+                return False
+            text = value.strip()
+            if not text:
+                return False
+            if "未覆盖" in text or "分析失败" in text or "未分析" in text:
+                return True
+            if re.search(r"\b\d{1,2}:\d{2}(:\d{2})?\b", text):
+                return True
+            if re.search(r":\d{2}\s*[-–—]\s*:\d{2}", text):
+                return True
+            if re.search(r"\b\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}\b", text):
+                return True
+            return False
 
         lines: list[str] = [f"# {self.title}", ""]
         chapters = self._normalize_chapters(self.deep_dive)
@@ -477,23 +503,6 @@ class KnowledgeDocument:
                 for line_num, line in enumerate(code_lines, 1):
                     lines.append(f"{line_num}. {line}")
                 lines.append("")
-
-                lines.append("逐行说明：")
-                lines.append("")
-                for line_num, line in enumerate(code_lines, 1):
-                    lowered = line.lower()
-                    if "fit" in lowered or "train" in lowered:
-                        explanation = "执行训练或拟合步骤。"
-                    elif "predict" in lowered:
-                        explanation = "输出预测结果供后续评估。"
-                    elif "print" in lowered or "log" in lowered:
-                        explanation = "打印或记录关键结果。"
-                    elif "load" in lowered or "read" in lowered:
-                        explanation = "加载必要的数据或模型。"
-                    else:
-                        explanation = "完成关键计算或调用步骤。"
-                    lines.append(f"{line_num}：{explanation}")
-                lines.append("")
         else:
             lines.append("本讲无可复用代码片段")
             lines.append("")
@@ -536,15 +545,6 @@ class KnowledgeDocument:
                     if question and answer:
                         exercises.append((question, answer))
 
-        if len(exercises) < 2:
-            topic_pool: list[str] = []
-            for chapter in chapters:
-                topic_pool.extend(collect_topics(chapter.get("sections", [])))
-            for topic in topic_pool[:4]:
-                question = f"为什么 {topic} 在本讲中是关键环节？"
-                answer = f"因为 {topic} 直接影响核心流程的效果与可解释性。"
-                exercises.append((cleaned_main(question), cleaned_main(answer)))
-
         deduped_exercises: list[tuple[str, str]] = []
         seen_questions = set()
         for question, answer in exercises:
@@ -554,19 +554,14 @@ class KnowledgeDocument:
             deduped_exercises.append((question, answer))
 
         selected_exercises = deduped_exercises[:4]
-        if len(selected_exercises) < 2:
-            fallback_question = "结合本讲内容，说明一个关键概念的应用场景。"
-            fallback_answer = "可用于解决与核心概念相关的实际建模或决策问题。"
-            selected_exercises.append((fallback_question, fallback_answer))
-        selected_exercises = selected_exercises[:4]
-
-        lines.append("练习与答解：")
-        lines.append("")
-        for idx, (question, _) in enumerate(selected_exercises, 1):
-            lines.append(f"{idx}. {question}")
-        for _, (_, answer) in enumerate(selected_exercises, 1):
-            lines.append(f"答：{answer}")
-        lines.append("")
+        if selected_exercises:
+            lines.append("练习与答解：")
+            lines.append("")
+            for idx, (question, _) in enumerate(selected_exercises, 1):
+                lines.append(f"{idx}. {question}")
+            for _, (_, answer) in enumerate(selected_exercises, 1):
+                lines.append(f"答：{answer}")
+            lines.append("")
 
         lines.extend(["## 📎 附录 (Appendix)", ""])
         lines.append("### 图解（知识蓝图）")
@@ -608,22 +603,28 @@ class KnowledgeDocument:
             lines.append("- 暂无术语补充")
         lines.append("")
 
-        lines.append("### 概念索引（Concept Index）")
-        lines.append("")
-        index_items: list[str] = []
-        if self.key_takeaways:
-            index_items.extend([cleaned(takeaway) for takeaway in self.key_takeaways])
-        index_items.extend(concept_index)
-        if self.glossary:
-            index_items.extend([cleaned(key) for key in self.glossary])
-        seen = set()
-        for item in index_items:
-            if item and item not in seen:
+        if include_concept_index:
+            lines.append("### 概念索引（Concept Index）")
+            lines.append("")
+            index_items: list[str] = []
+            if self.key_takeaways:
+                index_items.extend(
+                    [cleaned(takeaway) for takeaway in self.key_takeaways]
+                )
+            index_items.extend(concept_index)
+            if self.glossary:
+                index_items.extend([cleaned(key) for key in self.glossary])
+            seen = set()
+            for item in index_items:
+                if not item or is_gap_note_or_timecode(item):
+                    continue
+                if item in seen:
+                    continue
                 seen.add(item)
                 lines.append(f"- {item}")
-        if not seen:
-            lines.append("- 暂无概念索引")
-        lines.append("")
+            if not seen:
+                lines.append("- 暂无概念索引")
+            lines.append("")
 
         lines.append("### 代码与伪代码")
         lines.append("")
@@ -1251,6 +1252,7 @@ class AnalysisResult:
         self,
         image_paths: list[str] | None = None,
         self_check_mode: str = "static",
+        include_concept_index: bool | None = None,
     ) -> str:
         """
         生成完整的 Markdown 文档
@@ -1265,6 +1267,7 @@ class AnalysisResult:
         markdown = self.knowledge_doc.to_markdown(
             image_paths=image_paths,
             self_check_mode=self_check_mode,
+            include_concept_index=include_concept_index,
         )
 
         normalized_mode = (self_check_mode or "").strip().lower()

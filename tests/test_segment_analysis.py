@@ -379,6 +379,182 @@ def test_consolidate_segments_enforces_bounds(tmp_path: Path) -> None:
     assert 2 <= len(result.get("deep_dive", [])) <= 6
 
 
+def test_single_pass_consolidation_runs_once(tmp_path: Path) -> None:
+    config = _base_config(tmp_path)
+    system_config = config["system"]
+    assert isinstance(system_config, dict)
+    system_config["quality_gates"] = {
+        "enabled": True,
+        "max_extra_llm_calls": 1,
+    }
+    analyzer_config = config["analyzer"]
+    assert isinstance(analyzer_config, dict)
+    long_video = analyzer_config["long_video"]
+    assert isinstance(long_video, dict)
+    long_video["enabled"] = False
+
+    counter = APICounter(max_calls=10, current_count=0)
+    analyzer = _make_analyzer(config, counter)
+
+    video_path = tmp_path / "video.mp4"
+    _write_dummy_video(video_path)
+
+    response = {
+        "title": "Single",
+        "one_sentence_summary": "Summary",
+        "key_takeaways": ["A"],
+        "deep_dive": [
+            {
+                "chapter_title": "Ch1",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t1", "explanation": "e1", "timestamp": "00:00:10"}
+                ],
+            },
+            {
+                "chapter_title": "Ch2",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t2", "explanation": "e2", "timestamp": "00:00:20"}
+                ],
+            },
+            {
+                "chapter_title": "Ch3",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t3", "explanation": "e3", "timestamp": "00:00:30"}
+                ],
+            },
+        ],
+        "glossary": {},
+        "visual_schemas": [
+            {
+                "type": "overview",
+                "description": "",
+                "schema": "---BEGIN PROMPT---\nX\n---END PROMPT---",
+            }
+        ],
+    }
+    consolidated = {
+        "title": "Single",
+        "one_sentence_summary": "Summary",
+        "key_takeaways": ["A"],
+        "deep_dive": [
+            {
+                "chapter_title": "Concepts",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t1", "explanation": "e1", "timestamp": "00:00:10"}
+                ],
+            },
+            {
+                "chapter_title": "Practice",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t2", "explanation": "e2", "timestamp": "00:00:20"},
+                    {"topic": "t3", "explanation": "e3", "timestamp": "00:00:30"},
+                ],
+            },
+        ],
+        "glossary": {},
+    }
+
+    analyzer._upload_video = Mock(return_value=_fake_video_file())
+    analyzer._generate_content = Mock(return_value=response)
+    analyzer._call_gemini_text_api = Mock(return_value=json.dumps(consolidated))
+
+    with patch("analyzer.content_analyzer.probe_duration", return_value=30.0):
+        result = analyzer.analyze_video(video_path)
+
+    analyzer._call_gemini_text_api.assert_called_once()
+    assert len(result.knowledge_doc.deep_dive) == 2
+
+
+def test_single_pass_consolidation_out_of_range_falls_back(
+    tmp_path: Path,
+) -> None:
+    config = _base_config(tmp_path)
+    system_config = config["system"]
+    assert isinstance(system_config, dict)
+    system_config["quality_gates"] = {
+        "enabled": True,
+        "max_extra_llm_calls": 1,
+    }
+    analyzer_config = config["analyzer"]
+    assert isinstance(analyzer_config, dict)
+    long_video = analyzer_config["long_video"]
+    assert isinstance(long_video, dict)
+    long_video["enabled"] = False
+
+    counter = APICounter(max_calls=10, current_count=0)
+    analyzer = _make_analyzer(config, counter)
+
+    video_path = tmp_path / "video.mp4"
+    _write_dummy_video(video_path)
+
+    response = {
+        "title": "Single",
+        "one_sentence_summary": "Summary",
+        "key_takeaways": ["A"],
+        "deep_dive": [
+            {
+                "chapter_title": "Ch1",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t1", "explanation": "e1", "timestamp": "00:00:10"}
+                ],
+            },
+            {
+                "chapter_title": "Ch2",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t2", "explanation": "e2", "timestamp": "00:00:20"}
+                ],
+            },
+            {
+                "chapter_title": "Ch3",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t3", "explanation": "e3", "timestamp": "00:00:30"}
+                ],
+            },
+        ],
+        "glossary": {},
+        "visual_schemas": [
+            {
+                "type": "overview",
+                "description": "",
+                "schema": "---BEGIN PROMPT---\nX\n---END PROMPT---",
+            }
+        ],
+    }
+    consolidated = {
+        "title": "Single",
+        "one_sentence_summary": "Summary",
+        "key_takeaways": ["A"],
+        "deep_dive": [
+            {
+                "chapter_title": "Only",
+                "chapter_summary": "",
+                "sections": [
+                    {"topic": "t1", "explanation": "e1", "timestamp": "00:00:10"}
+                ],
+            }
+        ],
+        "glossary": {},
+    }
+
+    analyzer._upload_video = Mock(return_value=_fake_video_file())
+    analyzer._generate_content = Mock(return_value=response)
+    analyzer._call_gemini_text_api = Mock(return_value=json.dumps(consolidated))
+
+    with patch("analyzer.content_analyzer.probe_duration", return_value=30.0):
+        result = analyzer.analyze_video(video_path)
+
+    analyzer._call_gemini_text_api.assert_called_once()
+    assert len(result.knowledge_doc.deep_dive) == 3
+
+
 def test_consolidation_failure_falls_back(tmp_path: Path) -> None:
     config = _base_config(tmp_path)
     counter = APICounter(max_calls=10, current_count=0)

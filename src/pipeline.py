@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -31,6 +32,7 @@ from utils.counter import (  # type: ignore[reportImplicitRelativeImport]
 from utils.gemini_throttle import (  # type: ignore[reportImplicitRelativeImport]
     GeminiThrottle,
 )
+from utils.note_quality import apply_quality_gates  # type: ignore[reportImplicitRelativeImport]
 from utils.note_refiner import refine_note  # type: ignore[reportImplicitRelativeImport]
 from utils.progress_tracker import (  # type: ignore[reportImplicitRelativeImport]
     ProgressTracker,
@@ -93,6 +95,7 @@ class VideoPipeline:
         self.blueprint_dir.mkdir(parents=True, exist_ok=True)
 
         self.self_check_mode = self._resolve_self_check_mode(config)
+        self.include_concept_index = self._resolve_include_concept_index(config)
 
         # 校验配置
         validator_config = config.get("validator", {})
@@ -184,7 +187,8 @@ class VideoPipeline:
             final_structure = self._validation_loop(
                 first_schema,
                 analysis_result.knowledge_doc.to_markdown(
-                    self_check_mode=self.self_check_mode
+                    self_check_mode=self.self_check_mode,
+                    include_concept_index=self.include_concept_index,
                 ),
                 analyzer,
             )
@@ -214,7 +218,8 @@ class VideoPipeline:
                             audit_result = auditor.audit_image(
                                 image_path=blueprint_path_temp,
                                 knowledge_doc_content=analysis_result.knowledge_doc.to_markdown(
-                                    self_check_mode=self.self_check_mode
+                                    self_check_mode=self.self_check_mode,
+                                    include_concept_index=self.include_concept_index,
                                 ),
                             )
 
@@ -477,6 +482,20 @@ class VideoPipeline:
                 config=refine_config,
             )
 
+        quality_config = self.config.get("system", {}).get("quality_gates", {})
+        quality_enabled = bool(quality_config.get("enabled", False))
+        if quality_enabled:
+            note_profile = self.config.get("system", {}).get("note_profile", "default")
+            document_content, report = apply_quality_gates(
+                document_content,
+                str(note_profile),
+                quality_config,
+            )
+            report_path = self.doc_dir / f"{video_id}_quality_report.json"
+            with open(report_path, "w", encoding="utf-8") as report_file:
+                json.dump(report, report_file, ensure_ascii=True, indent=2)
+            self.logger.info(f"📄 质量报告已保存: {report_path}")
+
         # 文档路径: {video_id}_knowledge_note.md
         doc_path = self.doc_dir / f"{video_id}_knowledge_note.md"
         with open(doc_path, "w", encoding="utf-8") as f:
@@ -505,6 +524,15 @@ class VideoPipeline:
         }:
             return normalized
         return "lecture"
+
+    @staticmethod
+    def _resolve_include_concept_index(config: dict[str, Any]) -> bool:
+        system_config = config.get("system", {})
+        render_config = system_config.get("render", {})
+        if "include_concept_index" in render_config:
+            return bool(render_config.get("include_concept_index"))
+        note_profile = str(system_config.get("note_profile", "default")).lower()
+        return note_profile != "pdf"
 
     def _extract_video_id(self, url: str) -> str:
         """

@@ -5,8 +5,9 @@ import sys
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict
+from typing import Any, Optional, List, Dict
 from collections import defaultdict
+import yaml
 
 
 @dataclass
@@ -87,6 +88,47 @@ TIMESTAMP_PATTERNS = [
     r"\b\d{1,2}:\d{2}\b",
     r"\(\d{1,2}:\d{2}[–—-]\d{1,2}:\d{2}\)",
 ]
+
+GARBAGE_PATTERNS = {
+    "placeholder_repeated": r"完成关键计算或调用步骤",
+    "template_exercise": r"因为 X 直接影响核心流程的效果与可解释性",
+    "timestamp_artifact": r":\d{2}-:\d{2}",
+}
+
+
+def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load config.yaml to detect PDF profile settings."""
+    if config_path is None:
+        # Try to find config.yaml relative to this file
+        current_file = Path(__file__).resolve()
+        project_root = current_file.parent.parent.parent
+        config_path = project_root / "config" / "config.yaml"
+
+    if not config_path.exists():
+        return {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def is_pdf_profile(config: Dict[str, Any]) -> bool:
+    """Check if PDF profile is enabled."""
+    return config.get("system", {}).get("note_profile") == "pdf"
+
+
+def is_display_math_enabled(config: Dict[str, Any]) -> bool:
+    """Check if display math is enabled."""
+    return (
+        config.get("system", {}).get("pdf_math", {}).get("enable_display_math", False)
+    )
+
+
+def is_tikz_enabled(config: Dict[str, Any]) -> bool:
+    """Check if TikZ diagrams are enabled."""
+    return config.get("system", {}).get("pdf_diagrams", {}).get("enable_tikz", False)
 
 
 def check_title(content: str) -> List[Violation]:
@@ -197,11 +239,74 @@ def check_chapter_structure(content: str) -> List[Violation]:
     return violations
 
 
-def check_forbidden_patterns(content: str) -> List[Violation]:
+def check_forbidden_patterns(
+    content: str, config: Optional[Dict[str, Any]] = None
+) -> List[Violation]:
     violations = []
     lines = content.split("\n")
 
-    for pattern_name, pattern in FORBIDDEN_PATTERNS.items():
+    if config is None:
+        config = {}
+
+    pdf_profile = is_pdf_profile(config)
+    display_math_ok = is_display_math_enabled(config)
+    tikz_ok = is_tikz_enabled(config)
+
+    in_latex_block = False
+
+    for i, line in enumerate(lines, 1):
+        if line.strip().startswith("```{=latex}"):
+            in_latex_block = True
+            if not (pdf_profile and tikz_ok):
+                violations.append(
+                    Violation(
+                        rule="latex_block_not_allowed",
+                        line=i,
+                        message="Raw LaTeX block found but PDF profile with TikZ not enabled",
+                    )
+                )
+            continue
+
+        if in_latex_block:
+            if line.strip() == "```":
+                in_latex_block = False
+            continue
+
+        for pattern_name, pattern in FORBIDDEN_PATTERNS.items():
+            if pattern_name == "latex_dollar":
+                matches = list(re.finditer(r"\$\$[^$]+\$\$", line))
+                for match in matches:
+                    if not (pdf_profile and display_math_ok):
+                        violations.append(
+                            Violation(
+                                rule="latex_display_math_not_allowed",
+                                line=i,
+                                message=f"Display math found but PDF profile with display_math not enabled: {match.group()[:50]}",
+                            )
+                        )
+
+                matches = list(re.finditer(r"\$[^$]+\$", line))
+                for match in matches:
+                    if not match.group().startswith("$$"):
+                        violations.append(
+                            Violation(
+                                rule=pattern_name,
+                                line=i,
+                                message=f"Inline LaTeX math (single $) forbidden: {match.group()[:50]}",
+                            )
+                        )
+            else:
+                matches = re.finditer(pattern, line)
+                for match in matches:
+                    violations.append(
+                        Violation(
+                            rule=pattern_name,
+                            line=i,
+                            message=f"Forbidden pattern '{pattern_name}' found: {match.group()[:50]}",
+                        )
+                    )
+
+    for pattern_name, pattern in GARBAGE_PATTERNS.items():
         for i, line in enumerate(lines, 1):
             matches = re.finditer(pattern, line)
             for match in matches:
@@ -209,7 +314,7 @@ def check_forbidden_patterns(content: str) -> List[Violation]:
                     Violation(
                         rule=pattern_name,
                         line=i,
-                        message=f"Forbidden pattern '{pattern_name}' found: {match.group()[:50]}",
+                        message=f"Garbage pattern '{pattern_name}' found: {match.group()[:50]}",
                     )
                 )
 
@@ -247,9 +352,14 @@ def check_timestamps_in_main_text(content: str) -> List[Violation]:
     return violations
 
 
-def validate_note(content: str) -> ValidationResult:
+def validate_note(
+    content: str, config: Optional[Dict[str, Any]] = None
+) -> ValidationResult:
     all_violations = []
     lecture_format = detect_lecture_format(content)
+
+    if config is None:
+        config = load_config()
 
     all_violations.extend(check_title(content))
     if lecture_format == "textbook":
@@ -259,7 +369,7 @@ def validate_note(content: str) -> ValidationResult:
     else:
         all_violations.extend(check_required_sections(content))
         all_violations.extend(check_chapter_structure(content))
-    all_violations.extend(check_forbidden_patterns(content))
+    all_violations.extend(check_forbidden_patterns(content, config))
     all_violations.extend(check_timestamps_in_main_text(content))
 
     all_violations.sort(key=lambda v: (v.line, v.rule))

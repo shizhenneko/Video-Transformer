@@ -41,6 +41,28 @@ system:
     tolerance_ratio: 0.10
     exclude_code_from_budget: false
 
+  # PDF profile + LaTeX boundary
+  # - Upstream analysis JSON MUST remain plain text (no LaTeX/TikZ in JSON strings)
+  # - LaTeX injection allowed only in final Markdown rendering:
+  #   * display math: $$ ... $$
+  #   * TikZ blocks: ```{=latex} ... ```
+  # - If Pandoc/LaTeX prerequisites are missing, skip PDF export and keep Markdown
+  note_profile: "pdf"  # Options: "default" | "pdf"
+  quality_gates:
+    enabled: true
+    max_extra_llm_calls: 1
+  pdf_math:
+    enable_display_math: true
+  pdf_diagrams:
+    enable_tikz: true
+  render:
+    include_concept_index: false  # Set false for PDF profile
+  pdf_typesetting:
+    engine: "xelatex"  # Options: "xelatex" | "lualatex"
+    mainfont: "TeX Gyre Termes"
+    monofont: "DejaVu Sans Mono"
+    header_tex_path: ".sisyphus/evidence/preamble.tex"  # Optional path to extra LaTeX header.tex
+
 proxy:
   base_url: "http://localhost:8000"
   http: "http://127.0.0.1:7897"  # Google API 代理地址

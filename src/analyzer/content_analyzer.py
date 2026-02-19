@@ -85,6 +85,7 @@ class ContentAnalyzer:
         self._allocated_api_key = api_key
         self._client: genai.Client | None = None
         self._llm_repair_used = False
+        self._extra_llm_calls_used = 0
 
         http_proxy = proxy_config.get("http")
 
@@ -462,6 +463,34 @@ class ContentAnalyzer:
                 return None
         return None
 
+    @staticmethod
+    def _coerce_int(value: object, default: int) -> int:
+        if isinstance(value, (int, float, str)):
+            try:
+                return int(value)
+            except ValueError:
+                return default
+        return default
+
+    def _quality_gates_enabled(self) -> bool:
+        system_config = self.config.get("system", {})
+        if not isinstance(system_config, dict):
+            return False
+        quality_gates = system_config.get("quality_gates", {})
+        if not isinstance(quality_gates, dict):
+            quality_gates = {}
+        return bool(quality_gates.get("enabled", False))
+
+    def _max_extra_llm_calls(self) -> int:
+        system_config = self.config.get("system", {})
+        if not isinstance(system_config, dict):
+            return 0
+        quality_gates = system_config.get("quality_gates", {})
+        if not isinstance(quality_gates, dict):
+            quality_gates = {}
+        max_calls = self._coerce_int(quality_gates.get("max_extra_llm_calls", 1), 1)
+        return max(max_calls, 0)
+
     def _should_use_segmentation(
         self, duration: float, plan: SegmentPlan, long_video_config: dict[str, Any]
     ) -> bool:
@@ -533,6 +562,7 @@ class ContentAnalyzer:
         分析视频内容，生成完整的分析结果
         """
         self._llm_repair_used = False
+        self._extra_llm_calls_used = 0
         video_path = Path(video_path)
         if not video_path.exists():
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
@@ -623,6 +653,11 @@ class ContentAnalyzer:
                     self.logger.warning(
                         "API 配额不足以执行 Step 2，跳过 Visual Schema 生成"
                     )
+
+            response_data = self._maybe_consolidate_note(
+                response_data,
+                context="single_pass",
+            )
 
             metadata = {
                 "video_name": video_path.name,
@@ -910,16 +945,10 @@ class ContentAnalyzer:
             raise RuntimeError("分段分析失败，未获得任何有效结果")
 
         merged = self._merge_segment_outputs(segment_outputs, gap_notes)
-        if long_video_config.get("consolidate", True):
-            if not self.api_counter.can_call():
-                self.logger.warning("API 配额不足以执行分段汇总，使用合并结果")
-            else:
-                try:
-                    consolidated = self._consolidate_segments(merged)
-                    if consolidated:
-                        merged = consolidated
-                except Exception as exc:
-                    self.logger.warning(f"分段汇总失败，使用合并结果: {exc}")
+        merged = self._maybe_consolidate_note(
+            merged,
+            context="segment_merge",
+        )
         metadata = {
             "video_name": video_path.name,
             "video_size": video_path.stat().st_size,
@@ -1036,6 +1065,62 @@ class ContentAnalyzer:
 
         return merged
 
+    def _maybe_consolidate_note(
+        self,
+        note: dict[str, Any],
+        *,
+        context: str,
+    ) -> dict[str, Any]:
+        if not self._quality_gates_enabled():
+            self.logger.info(
+                "event=consolidation_skipped reason=quality_gates_disabled "
+                f"context={context}"
+            )
+            return note
+
+        max_extra_calls = self._max_extra_llm_calls()
+        if max_extra_calls <= 0:
+            self.logger.info(
+                "event=consolidation_skipped reason=max_extra_llm_calls_disabled "
+                f"context={context}"
+            )
+            return note
+
+        if self._extra_llm_calls_used >= max_extra_calls:
+            self.logger.warning(
+                "event=consolidation_skipped reason=extra_llm_calls_exhausted "
+                f"used={self._extra_llm_calls_used} max={max_extra_calls} context={context}"
+            )
+            return note
+
+        if not self.api_counter.can_call():
+            self.logger.warning(
+                f"event=consolidation_skipped reason=api_budget_exhausted context={context}"
+            )
+            return note
+
+        deep_dive = self._normalize_chapters(note.get("deep_dive", []))
+        if not deep_dive:
+            self.logger.warning(
+                f"event=consolidation_skipped reason=empty_deep_dive context={context}"
+            )
+            return note
+
+        self._extra_llm_calls_used += 1
+        try:
+            consolidated = self._consolidate_segments(note)
+        except Exception as exc:
+            self.logger.warning(
+                f"event=consolidation_failed context={context} error={exc}"
+            )
+            return note
+
+        if consolidated:
+            return consolidated
+
+        self.logger.warning(f"event=consolidation_failed context={context}")
+        return note
+
     def _consolidate_segments(self, merged: dict[str, Any]) -> dict[str, Any] | None:
         deep_dive = self._normalize_chapters(merged.get("deep_dive", []))
         if not deep_dive:
@@ -1115,7 +1200,26 @@ class ContentAnalyzer:
 
         consolidated_chapters = self._normalize_chapters(parsed.get("deep_dive", []))
         if not 2 <= len(consolidated_chapters) <= 6:
-            self.logger.warning("分段汇总失败：章节数量不在 2-6 范围内")
+            self.logger.warning(
+                "分段汇总失败：章节数量不在 2-6 范围内 "
+                f"(count={len(consolidated_chapters)})"
+            )
+            return None
+
+        seen_titles: set[str] = set()
+        duplicate_titles: set[str] = set()
+        for chapter in consolidated_chapters:
+            normalized_title = self._normalize_text(
+                str(chapter.get("chapter_title", ""))
+            )
+            if normalized_title in seen_titles:
+                duplicate_titles.add(normalized_title or "(empty)")
+            else:
+                seen_titles.add(normalized_title)
+
+        if duplicate_titles:
+            duplicates = ", ".join(sorted(duplicate_titles))
+            self.logger.warning(f"分段汇总失败：章节标题重复 (normalized={duplicates})")
             return None
         parsed["deep_dive"] = consolidated_chapters
 
@@ -1924,9 +2028,13 @@ class ContentAnalyzer:
         Returns:
             Markdown 格式的知识笔记报告
         """
+        system_config = self.config.get("system", {})
+        render_config = system_config.get("render", {})
+        include_concept_index = render_config.get("include_concept_index")
         return analysis.to_markdown(
             image_paths=[image_relative_path] if image_relative_path else None,
             self_check_mode=self_check_mode,
+            include_concept_index=include_concept_index,
         )
 
     def rewrite_visual_schema(
